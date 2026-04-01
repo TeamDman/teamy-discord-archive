@@ -1,0 +1,57 @@
+// repo[impl tracey.specification.present]
+@schema {id crate:tracey-config@1, cli tracey}
+
+specs (
+    {
+        name teamy-discord-archive-publishing-standards
+        source_url https://github.com/TeamDman/teamy-discord-archive
+        include (docs/spec/repo/**/*.md)
+        impls (
+            {
+                name repo
+                include_plain (
+                    README.md
+                    Cargo.toml
+                    LICENSE
+                    .config/tracey/config.styx
+                )
+            }
+        )
+    }
+    {
+        name teamy-discord-archive-tool-standards
+        source_url https://github.com/TeamDman/teamy-discord-archive
+        include (docs/spec/tools/**/*.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+    {
+        name teamy-discord-archive-cli
+        source_url https://github.com/TeamDman/teamy-discord-archive
+        include (docs/spec/product/cli.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+    {
+        name teamy-discord-archive-archive-goals
+        source_url https://github.com/TeamDman/teamy-discord-archive
+        include (docs/spec/product/archive.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+)
