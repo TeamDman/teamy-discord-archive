@@ -20,6 +20,7 @@ use std::time::Instant;
 const CHECKPOINT_VERSION: u32 = 1;
 const MESSAGE_PAGE_LIMIT: u8 = 100;
 const DISCORD_EPOCH_MILLIS: i64 = 1_420_070_400_000;
+const DISCORD_MISSING_ACCESS_ERROR_CODE: isize = 50_001;
 const FALLBACK_ESTIMATED_MESSAGES_PER_TARGET: u64 = 400;
 const FALLBACK_ESTIMATED_BYTES_PER_MESSAGE: u64 = 2048;
 const MIN_ESTIMATION_SAMPLE_MESSAGES: u64 = 25;
@@ -96,8 +97,10 @@ pub struct SyncRunSummary {
 #[derive(Clone, Debug)]
 struct SyncTarget {
     guild_id: GuildId,
+    guild_name: String,
     channel: GuildChannel,
     is_thread: bool,
+    parent_channel_name: Option<String>,
 }
 
 impl SyncTarget {
@@ -107,6 +110,26 @@ impl SyncTarget {
 
     fn parent_channel_id(&self) -> Option<u64> {
         self.channel.parent_id.map(serenity::all::ChannelId::get)
+    }
+
+    fn guild_name(&self) -> &str {
+        &self.guild_name
+    }
+
+    fn channel_name(&self) -> &str {
+        if self.is_thread {
+            self.parent_channel_name.as_deref().unwrap_or("")
+        } else {
+            &self.channel.name
+        }
+    }
+
+    fn thread_name(&self) -> &str {
+        if self.is_thread {
+            &self.channel.name
+        } else {
+            ""
+        }
     }
 
     // archive[impl layout.guild-channel-thread]
@@ -221,6 +244,12 @@ struct SyncProgressTracker {
     targets_completed: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncTargetOutcome {
+    Completed(SyncWorkDelta),
+    SkippedMissingAccess(SyncWorkDelta),
+}
+
 impl SyncProgressTracker {
     fn new(targets: &[SyncTarget], checkpoint: &SyncCheckpoint) -> Self {
         let resumed_targets = targets
@@ -288,6 +317,23 @@ fn checkpoint_archived_bytes(state: Option<&SyncTargetCheckpoint>) -> u64 {
     state
         .and_then(|candidate| candidate.archived_byte_count)
         .unwrap_or(0)
+}
+
+fn discord_error_code(error: &serenity::Error) -> Option<isize> {
+    match error {
+        serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) => {
+            Some(response.error.code)
+        }
+        _ => None,
+    }
+}
+
+fn is_missing_access_error_code(error_code: Option<isize>) -> bool {
+    error_code == Some(DISCORD_MISSING_ACCESS_ERROR_CODE)
+}
+
+fn is_missing_access_error(error: &serenity::Error) -> bool {
+    is_missing_access_error_code(discord_error_code(error))
 }
 
 fn target_has_resume_state(state: &SyncTargetCheckpoint) -> bool {
@@ -693,29 +739,23 @@ async fn fetch_messages_before(
     http: &Http,
     channel_id: serenity::all::ChannelId,
     before: Option<u64>,
-) -> eyre::Result<Vec<Message>> {
+) -> serenity::Result<Vec<Message>> {
     let mut builder = GetMessages::new().limit(MESSAGE_PAGE_LIMIT);
     if let Some(before) = before {
         builder = builder.before(MessageId::new(before));
     }
-    channel_id
-        .messages(http, builder)
-        .await
-        .wrap_err_with(|| format!("Failed to list messages for channel {}", channel_id.get()))
+    channel_id.messages(http, builder).await
 }
 
 async fn fetch_messages_after(
     http: &Http,
     channel_id: serenity::all::ChannelId,
     after: u64,
-) -> eyre::Result<Vec<Message>> {
+) -> serenity::Result<Vec<Message>> {
     let builder = GetMessages::new()
         .limit(MESSAGE_PAGE_LIMIT)
         .after(MessageId::new(after));
-    channel_id
-        .messages(http, builder)
-        .await
-        .wrap_err_with(|| format!("Failed to list messages for channel {}", channel_id.get()))
+    channel_id.messages(http, builder).await
 }
 
 // archive[impl sync.progress.structured-logging]
@@ -730,7 +770,10 @@ fn log_target_started(
     tracing::info!(
         event = "sync.target.start",
         guild_id = target.guild_id.get(),
+        guild_name = target.guild_name(),
         channel_id = target.channel_id(),
+        channel_name = target.channel_name(),
+        thread_name = target.thread_name(),
         parent_channel_id = target.parent_channel_id(),
         is_thread = target.is_thread,
         target_index = target_index + 1,
@@ -749,6 +792,30 @@ fn log_target_started(
     );
 }
 
+fn log_target_skipped(
+    target: &SyncTarget,
+    target_index: usize,
+    phase: &str,
+    error: &serenity::Error,
+) {
+    tracing::warn!(
+        event = "sync.target.skipped",
+        phase,
+        reason = "missing-access",
+        guild_id = target.guild_id.get(),
+        guild_name = target.guild_name(),
+        channel_id = target.channel_id(),
+        channel_name = target.channel_name(),
+        thread_name = target.thread_name(),
+        parent_channel_id = target.parent_channel_id(),
+        is_thread = target.is_thread,
+        target_index = target_index + 1,
+        discord_error_code = discord_error_code(error).unwrap_or_default(),
+        error = %error,
+        "sync target skipped due to missing access"
+    );
+}
+
 // archive[impl sync.progress.estimated-telemetry]
 fn log_sync_progress(
     tracker: &SyncProgressTracker,
@@ -764,7 +831,10 @@ fn log_sync_progress(
         event = "sync.progress",
         phase,
         guild_id = target.guild_id.get(),
+        guild_name = target.guild_name(),
         channel_id = target.channel_id(),
+        channel_name = target.channel_name(),
+        thread_name = target.thread_name(),
         parent_channel_id = target.parent_channel_id(),
         is_thread = target.is_thread,
         target_index = target_index + 1,
@@ -819,14 +889,20 @@ async fn build_sync_plans(http: &Http, guilds: &[GuildInfo]) -> eyre::Result<Vec
             .get_channels(guild.id)
             .await
             .wrap_err_with(|| format!("Failed to list channels for guild {}", guild.id.get()))?;
+        let channel_names = channels
+            .iter()
+            .map(|channel| (channel.id, channel.name.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
         let channel_targets = channels
             .iter()
             .filter(|channel| is_syncable_channel_kind(channel.kind))
             .cloned()
             .map(|channel| SyncTarget {
                 guild_id: guild.id,
+                guild_name: guild.name.clone(),
                 channel,
                 is_thread: false,
+                parent_channel_name: None,
             })
             .collect::<Vec<_>>();
         let threads = http
@@ -840,6 +916,10 @@ async fn build_sync_plans(http: &Http, guilds: &[GuildInfo]) -> eyre::Result<Vec
             .into_iter()
             .map(|channel| SyncTarget {
                 guild_id: guild.id,
+                guild_name: guild.name.clone(),
+                parent_channel_name: channel
+                    .parent_id
+                    .and_then(|parent_id| channel_names.get(&parent_id).cloned()),
                 channel,
                 is_thread: true,
             })
@@ -878,7 +958,7 @@ async fn sync_newer_messages(
     tracker: &SyncProgressTracker,
     targets: &[SyncTarget],
     target_index: usize,
-) -> eyre::Result<SyncWorkDelta> {
+) -> eyre::Result<Option<SyncWorkDelta>> {
     let mut delta = SyncWorkDelta::default();
 
     loop {
@@ -890,7 +970,21 @@ async fn sync_newer_messages(
             break;
         };
 
-        let messages = fetch_messages_after(http, target.channel.id, after).await?;
+        let messages = match fetch_messages_after(http, target.channel.id, after).await {
+            Ok(messages) => messages,
+            Err(error) if is_missing_access_error(&error) => {
+                log_target_skipped(target, target_index, "newer-fetch", &error);
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!(
+                        "Failed to list messages for channel {}",
+                        target.channel.id.get()
+                    )
+                });
+            }
+        };
         if messages.is_empty() {
             break;
         }
@@ -936,7 +1030,7 @@ async fn sync_newer_messages(
         }
     }
 
-    Ok(delta)
+    Ok(Some(delta))
 }
 
 // archive[impl sync.resume-from-checkpoint]
@@ -953,7 +1047,7 @@ async fn sync_historical_messages(
     tracker: &SyncProgressTracker,
     targets: &[SyncTarget],
     target_index: usize,
-) -> eyre::Result<SyncWorkDelta> {
+) -> eyre::Result<Option<SyncWorkDelta>> {
     let mut delta = SyncWorkDelta::default();
 
     loop {
@@ -965,7 +1059,21 @@ async fn sync_historical_messages(
             break;
         }
 
-        let messages = fetch_messages_before(http, target.channel.id, before).await?;
+        let messages = match fetch_messages_before(http, target.channel.id, before).await {
+            Ok(messages) => messages,
+            Err(error) if is_missing_access_error(&error) => {
+                log_target_skipped(target, target_index, "historical-fetch", &error);
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!(
+                        "Failed to list messages for channel {}",
+                        target.channel.id.get()
+                    )
+                });
+            }
+        };
         if messages.is_empty() {
             target.checkpoint(checkpoint).historical_complete = true;
             save_checkpoint(layout, checkpoint)?;
@@ -1014,7 +1122,7 @@ async fn sync_historical_messages(
         );
     }
 
-    Ok(delta)
+    Ok(Some(delta))
 }
 
 #[expect(
@@ -1030,39 +1138,44 @@ async fn sync_target(
     tracker: &SyncProgressTracker,
     targets: &[SyncTarget],
     target_index: usize,
-) -> eyre::Result<SyncWorkDelta> {
+) -> eyre::Result<SyncTargetOutcome> {
     let mut delta = SyncWorkDelta::default();
     delta.bytes_processed = delta.bytes_processed.saturating_add(write_raw_json_file(
         &target.metadata_path(output_root),
         &target.channel,
     )?);
-    delta.add_assign(
-        sync_newer_messages(
-            http,
-            output_root,
-            layout,
-            checkpoint,
-            target,
-            tracker,
-            targets,
-            target_index,
-        )
-        .await?,
-    );
-    delta.add_assign(
-        sync_historical_messages(
-            http,
-            output_root,
-            layout,
-            checkpoint,
-            target,
-            tracker,
-            targets,
-            target_index,
-        )
-        .await?,
-    );
-    Ok(delta)
+    let Some(newer_delta) = sync_newer_messages(
+        http,
+        output_root,
+        layout,
+        checkpoint,
+        target,
+        tracker,
+        targets,
+        target_index,
+    )
+    .await?
+    else {
+        return Ok(SyncTargetOutcome::SkippedMissingAccess(delta));
+    };
+    delta.add_assign(newer_delta);
+
+    let Some(historical_delta) = sync_historical_messages(
+        http,
+        output_root,
+        layout,
+        checkpoint,
+        target,
+        tracker,
+        targets,
+        target_index,
+    )
+    .await?
+    else {
+        return Ok(SyncTargetOutcome::SkippedMissingAccess(delta));
+    };
+    delta.add_assign(historical_delta);
+    Ok(SyncTargetOutcome::Completed(delta))
 }
 
 // archive[impl sync.writes-output-files]
@@ -1094,8 +1207,10 @@ async fn sync_guild(
         summary.bytes_processed = summary.bytes_processed.saturating_add(write_raw_json_file(
             &SyncTarget {
                 guild_id: plan.guild.id,
+                guild_name: plan.guild.name.clone(),
                 channel: channel.clone(),
                 is_thread: false,
+                parent_channel_name: None,
             }
             .metadata_path(output_root),
             channel,
@@ -1109,13 +1224,16 @@ async fn sync_guild(
         let target_span = tracing::info_span!(
             "sync_target",
             guild_id = target.guild_id.get(),
+            guild_name = target.guild_name(),
             channel_id = target.channel_id(),
+            channel_name = target.channel_name(),
+            thread_name = target.thread_name(),
             parent_channel_id = target.parent_channel_id(),
             is_thread = target.is_thread
         );
         let _target_guard = target_span.enter();
         log_target_started(tracker, checkpoint, target, *next_target_index);
-        let target_delta = sync_target(
+        let (target_delta, progress_phase) = match sync_target(
             http,
             output_root,
             layout,
@@ -1125,7 +1243,13 @@ async fn sync_guild(
             targets,
             *next_target_index,
         )
-        .await?;
+        .await?
+        {
+            SyncTargetOutcome::Completed(target_delta) => (target_delta, "target-complete"),
+            SyncTargetOutcome::SkippedMissingAccess(target_delta) => {
+                (target_delta, "target-skipped")
+            }
+        };
         summary.messages_written = summary
             .messages_written
             .saturating_add(target_delta.messages_written);
@@ -1141,7 +1265,7 @@ async fn sync_guild(
             checkpoint,
             target,
             *next_target_index,
-            "target-complete",
+            progress_phase,
             target_delta,
         );
         tracker.mark_target_complete();
@@ -1155,13 +1279,16 @@ async fn sync_guild(
         let target_span = tracing::info_span!(
             "sync_target",
             guild_id = target.guild_id.get(),
+            guild_name = target.guild_name(),
             channel_id = target.channel_id(),
+            channel_name = target.channel_name(),
+            thread_name = target.thread_name(),
             parent_channel_id = target.parent_channel_id(),
             is_thread = target.is_thread
         );
         let _target_guard = target_span.enter();
         log_target_started(tracker, checkpoint, target, *next_target_index);
-        let target_delta = sync_target(
+        let (target_delta, progress_phase) = match sync_target(
             http,
             output_root,
             layout,
@@ -1171,7 +1298,13 @@ async fn sync_guild(
             targets,
             *next_target_index,
         )
-        .await?;
+        .await?
+        {
+            SyncTargetOutcome::Completed(target_delta) => (target_delta, "target-complete"),
+            SyncTargetOutcome::SkippedMissingAccess(target_delta) => {
+                (target_delta, "target-skipped")
+            }
+        };
         summary.messages_written = summary
             .messages_written
             .saturating_add(target_delta.messages_written);
@@ -1187,7 +1320,7 @@ async fn sync_guild(
             checkpoint,
             target,
             *next_target_index,
-            "target-complete",
+            progress_phase,
             target_delta,
         );
         tracker.mark_target_complete();
@@ -1282,6 +1415,7 @@ mod tests {
     use super::attachments_root;
     use super::checkpoint_state;
     use super::estimate_target_total_messages;
+    use super::is_missing_access_error_code;
     use super::load_attachment_index;
     use super::load_checkpoint;
     use super::overall_progress_metrics;
@@ -1311,8 +1445,10 @@ mod tests {
 
         SyncTarget {
             guild_id: GuildId::new(guild_id),
+            guild_name: format!("guild-{guild_id}"),
             channel,
             is_thread,
+            parent_channel_name: None,
         }
     }
 
@@ -1402,8 +1538,10 @@ mod tests {
 
         let target = SyncTarget {
             guild_id: GuildId::new(99),
+            guild_name: "guild-99".to_owned(),
             channel,
             is_thread: true,
+            parent_channel_name: Some("parent-channel".to_owned()),
         };
 
         assert_eq!(
@@ -1418,6 +1556,9 @@ mod tests {
         );
         assert_eq!(target.channel.kind, ChannelType::PublicThread);
         assert_eq!(target.channel.id, ChannelId::new(11));
+        assert_eq!(target.guild_name(), "guild-99");
+        assert_eq!(target.channel_name(), "parent-channel");
+        assert_eq!(target.thread_name(), "thread-name");
     }
 
     #[test]
@@ -1496,5 +1637,12 @@ mod tests {
         assert!(metrics.bytes_processed > 0);
         assert!(metrics.message_rate_per_sec > 0);
         assert!(metrics.eta_known);
+    }
+
+    #[test]
+    fn missing_access_error_code_is_recognized() {
+        assert!(is_missing_access_error_code(Some(50_001)));
+        assert!(!is_missing_access_error_code(Some(50_013)));
+        assert!(!is_missing_access_error_code(None));
     }
 }
