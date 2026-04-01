@@ -5,10 +5,13 @@ This specification covers the current user-facing command line behavior exposed 
 ## Command Surface
 
 cli[command.surface.core]
-The CLI must expose the `bot-token`, `cache`, `home`, `live`, `output-dir`, and `sync` commands.
+The CLI must expose the `bot-token`, `cache`, `home`, `invite`, `live`, `output-dir`, and `sync` commands.
 
 cli[command.surface.bot-token]
 The `bot-token` command group must expose the `clear`, `set`, `show-source`, and `validate` subcommands.
+
+cli[command.surface.invite]
+The CLI must expose a top-level `invite` command.
 
 cli[command.surface.cache]
 The `cache` command group must expose the `show`, `open`, and `clean` subcommands.
@@ -60,13 +63,22 @@ cli[path.cache.env-overrides-platform]
 If `TEAMY_DISCORD_ARCHIVE_CACHE_DIR` is set to a non-empty value, it must take precedence over the platform-derived cache directory.
 
 cli[auth.live-token.env]
-If `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN` is set to a non-empty value, `bot-token` and `live` commands may use it as the Discord bot token.
+If `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN` is set to a non-empty value, `bot-token`, `invite`, and `live` commands may use it as the Discord bot token.
 
 cli[auth.live-token.command-line-overrides-env]
 If `live --token <token>` is provided, it must take precedence over `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN`.
 
 cli[auth.live-token.preference-fallback]
 If neither `live --token <token>` nor `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN` is provided, `live` commands must use the persisted bot token preference from the application home directory.
+
+cli[auth.invite-token-resolution]
+If neither `invite --token <token>` nor `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN` is provided, the `invite` command must use the persisted bot token preference from the application home directory.
+
+cli[invite.prints-url]
+The `invite` command must print the resolved Discord bot invite URL to stdout.
+
+cli[invite.opens-browser-by-default]
+The `invite` command must open the resolved Discord bot invite URL in the default browser unless `--no-open` is provided.
 
 cli[auth.bot-token.set-persists-default]
 The `bot-token set <token>` command must persist the default Discord bot token in the application home directory.

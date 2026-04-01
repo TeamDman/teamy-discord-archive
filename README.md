@@ -16,6 +16,7 @@ The current implementation focuses on the first local-first pieces of the archiv
 - structured logging to stderr with optional NDJSON log files
 - app home and cache directory resolution
 - persisted Discord bot token preferences with command-line and environment overrides
+- a top-level invite command that prints and optionally opens the bot invite URL
 - read-only live Discord API inspection commands powered by serenity HTTP
 - persisted output directory preferences with environment-variable override
 - an initial `sync` command scaffold that resolves and prepares the effective output target
@@ -42,6 +43,12 @@ Remove the saved token from app-home:
 
 ```powershell
 cargo run -- bot-token clear
+```
+
+Print the bot invite URL and open it in the default browser:
+
+```powershell
+cargo run -- invite
 ```
 
 ```powershell
@@ -112,6 +119,12 @@ Remove the saved token while leaving the environment variable untouched:
 cargo run -- bot-token clear
 ```
 
+Print the bot invite URL without opening the browser:
+
+```powershell
+cargo run -- invite --no-open
+```
+
 Override the persisted output directory with an environment variable:
 
 ```powershell
@@ -155,7 +168,7 @@ The CLI currently recognizes these environment variables:
 
 - `TEAMY_DISCORD_ARCHIVE_HOME_DIR`: overrides the resolved application home directory
 - `TEAMY_DISCORD_ARCHIVE_CACHE_DIR`: overrides the resolved cache directory
-- `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN`: supplies the Discord bot token for `bot-token` and `live` commands
+- `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN`: supplies the Discord bot token for `bot-token`, `invite`, and `live` commands
 - `TEAMY_DISCORD_ARCHIVE_OUTPUT_DIR`: overrides the persisted output directory preference
 - `RUST_LOG`: provides a tracing filter when `--log-filter` is not supplied
 

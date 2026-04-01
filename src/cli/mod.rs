@@ -3,6 +3,7 @@ pub mod cache;
 pub mod facet_shape;
 pub mod global_args;
 pub mod home;
+pub mod invite;
 pub mod live;
 pub mod output_dir;
 pub mod sync;
@@ -11,6 +12,7 @@ use crate::cli::bot_token::BotTokenArgs;
 use crate::cli::cache::CacheArgs;
 use crate::cli::global_args::GlobalArgs;
 use crate::cli::home::HomeArgs;
+use crate::cli::invite::InviteArgs;
 use crate::cli::live::LiveArgs;
 use crate::cli::output_dir::OutputDirArgs;
 use crate::cli::sync::SyncArgs;
@@ -25,7 +27,7 @@ use figue::{self as args};
 /// Environment variables:
 /// - `TEAMY_DISCORD_ARCHIVE_HOME_DIR` overrides the resolved application home directory.
 /// - `TEAMY_DISCORD_ARCHIVE_CACHE_DIR` overrides the resolved cache directory.
-/// - `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN` supplies the Discord bot token for `bot-token` and `live` commands.
+/// - `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN` supplies the Discord bot token for `bot-token`, `invite`, and `live` commands.
 /// - `TEAMY_DISCORD_ARCHIVE_OUTPUT_DIR` overrides the persisted output directory preference.
 /// - `RUST_LOG` provides a tracing filter when `--log-filter` is omitted.
 #[derive(Facet, Arbitrary, Debug)]
@@ -75,6 +77,8 @@ pub enum Command {
     Cache(CacheArgs),
     /// Home-related commands.
     Home(HomeArgs),
+    /// Print and optionally open the Discord bot invite URL.
+    Invite(InviteArgs),
     /// Query live Discord data through the bot token.
     Live(LiveArgs),
     /// Output directory preference commands.
@@ -92,6 +96,7 @@ impl Command {
             Command::BotToken(args) => args.invoke().await,
             Command::Cache(args) => args.invoke().await,
             Command::Home(args) => args.invoke().await,
+            Command::Invite(args) => args.invoke().await,
             Command::Live(args) => args.invoke().await,
             Command::OutputDir(args) => args.invoke().await,
             Command::Sync(args) => args.invoke().await,
