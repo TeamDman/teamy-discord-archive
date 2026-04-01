@@ -11,6 +11,8 @@ pub mod paths;
 use crate::cli::Cli;
 
 /// Version string combining package version and git revision.
+// tool[impl cli.version.includes-semver]
+// tool[impl cli.version.includes-git-revision]
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (rev ",
@@ -27,6 +29,7 @@ const VERSION: &str = concat!(
 /// # Panics
 ///
 /// Panics if the CLI schema is invalid (should never happen with correct code).
+// repo[impl implementation.present]
 pub fn main() -> eyre::Result<()> {
     // Install color_eyre for better error reports
     color_eyre::install()?;

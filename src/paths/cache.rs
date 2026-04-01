@@ -28,6 +28,7 @@ impl CacheHome {
     /// # Errors
     ///
     /// This function will return an error if the cache directory cannot be determined.
+    // cli[impl path.cache.env-overrides-platform]
     pub fn resolve() -> eyre::Result<CacheHome> {
         if let Ok(override_dir) = std::env::var(super::APP_CACHE_ENV_VAR) {
             return Ok(CacheHome(PathBuf::from(override_dir)));

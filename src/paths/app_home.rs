@@ -46,6 +46,7 @@ impl AppHome {
     /// # Errors
     ///
     /// This function will return an error if the config directory cannot be determined.
+    // cli[impl path.app-home.env-overrides-platform]
     pub fn resolve() -> eyre::Result<AppHome> {
         if let Ok(override_dir) = env::var(super::APP_HOME_ENV_VAR) {
             return Ok(AppHome(PathBuf::from(override_dir)));

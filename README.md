@@ -1,10 +1,13 @@
 # Teamy Discord Archive
 
+<!-- repo[impl readme.package-page-badges] -->
 [![crates.io](https://img.shields.io/crates/v/teamy-discord-archive.svg)](https://crates.io/crates/teamy-discord-archive)
 [![license](https://img.shields.io/crates/l/teamy-discord-archive.svg)](https://crates.io/crates/teamy-discord-archive)
 
+<!-- repo[impl readme.media-demo] -->
 ![Teamy Rust CLI media demo](resources/main.png)
 
+<!-- repo[impl readme.explanation] -->
 Discord archival CLI for exporting guild content to a local filesystem target.
 
 ## Current Focus
@@ -21,6 +24,7 @@ The current implementation focuses on the first local-first pieces of the archiv
 - persisted output directory preferences with environment-variable override
 - a resumable `sync` command that archives guild metadata, message payloads, and attachments to the output directory
 
+<!-- repo[impl readme.code-example] -->
 ## Quick Start
 
 ```powershell
@@ -193,6 +197,11 @@ For Tracy profiling, run:
 ```powershell
 ./run-tracing.ps1 output-dir show
 ```
+
+<!-- repo[impl license.present] -->
+## License
+
+[LICENSE](LICENSE)
 
 ## Repository Layout
 

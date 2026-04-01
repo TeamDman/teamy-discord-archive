@@ -30,6 +30,11 @@ use figue::{self as args};
 /// - `TEAMY_DISCORD_ARCHIVE_DISCORD_BOT_TOKEN` supplies the Discord bot token for `bot-token`, `invite`, and `live` commands.
 /// - `TEAMY_DISCORD_ARCHIVE_OUTPUT_DIR` overrides the persisted output directory preference.
 /// - `RUST_LOG` provides a tracing filter when `--log-filter` is omitted.
+// cli[impl parser.args-consistent]
+// cli[impl parser.roundtrip]
+// tool[impl cli.help.describes-behavior]
+// tool[impl cli.help.describes-argv]
+// tool[impl cli.help.describes-environment]
 #[derive(Facet, Arbitrary, Debug)]
 pub struct Cli {
     /// Global arguments (`debug`, `log_filter`, `log_file`).
@@ -39,6 +44,7 @@ pub struct Cli {
     /// Standard CLI options (help, version, completions).
     #[facet(flatten)]
     #[arbitrary(default)]
+    // tool[impl cli.help.position-independent]
     pub builtins: FigueBuiltins,
 
     /// The command to run.
@@ -79,6 +85,7 @@ pub enum Command {
     /// Home-related commands.
     Home(HomeArgs),
     /// Print and optionally open the Discord bot invite URL.
+    // cli[impl command.surface.invite]
     Invite(InviteArgs),
     /// Query live Discord data through the bot token.
     Live(LiveArgs),

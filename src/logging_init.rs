@@ -22,6 +22,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// # Panics
 ///
 /// This function may panic if locking or cloning the log file handle fails.
+// tool[impl logging.file-path-option]
 pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
     let subscriber = Registry::default();
 
@@ -39,6 +40,7 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
         .with_file(cfg!(debug_assertions))
         .with_line_number(cfg!(debug_assertions))
         .with_target(true)
+        // tool[impl logging.stderr-output]
         .with_writer(std::io::stderr)
         .pretty()
         .without_time();
@@ -67,6 +69,7 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
         });
 
         let json_layer = tracing_subscriber::fmt::layer()
+            // tool[impl logging.file-structured-ndjson]
             .event_format(tracing_subscriber::fmt::format().json())
             .with_file(true)
             .with_target(false)
