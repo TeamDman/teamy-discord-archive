@@ -17,6 +17,12 @@ The `sync` command must write archived guild, channel, thread, message, and atta
 archive[sync.resume-from-checkpoint]
 The `sync` command must persist per-target cursors so that interrupted runs can resume rather than restarting from scratch.
 
+archive[sync.progress.structured-logging]
+The `sync` command must emit structured tracing progress updates suitable for live monitoring and Tracy inspection, including resume-aware target state and current sync position.
+
+archive[sync.progress.estimated-telemetry]
+The `sync` command must report estimated progress telemetry during archival work, including messages-per-second, bytes processed, estimated remaining messages and bytes, and ETA values.
+
 archive[goal.live-api-probing]
 The product must provide a live-query command surface for inspecting Discord API behavior separately from archived data queries.
 

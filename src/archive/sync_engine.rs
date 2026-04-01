@@ -15,9 +15,14 @@ use sha2::Sha256;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Instant;
 
 const CHECKPOINT_VERSION: u32 = 1;
 const MESSAGE_PAGE_LIMIT: u8 = 100;
+const DISCORD_EPOCH_MILLIS: i64 = 1_420_070_400_000;
+const FALLBACK_ESTIMATED_MESSAGES_PER_TARGET: u64 = 400;
+const FALLBACK_ESTIMATED_BYTES_PER_MESSAGE: u64 = 2048;
+const MIN_ESTIMATION_SAMPLE_MESSAGES: u64 = 25;
 
 #[derive(Facet, Clone, Debug, Default, PartialEq, Eq)]
 #[facet(rename_all = "kebab-case")]
@@ -35,6 +40,8 @@ pub struct SyncTargetCheckpoint {
     pub newest_message_id: Option<u64>,
     pub oldest_message_id: Option<u64>,
     pub historical_complete: bool,
+    pub archived_message_count: Option<u64>,
+    pub archived_byte_count: Option<u64>,
 }
 
 #[derive(Facet, Clone, Debug, PartialEq, Eq)]
@@ -80,8 +87,10 @@ pub struct SyncRunSummary {
     pub guilds_seen: u64,
     pub channels_seen: u64,
     pub threads_seen: u64,
+    pub resumed_targets: u64,
     pub messages_written: u64,
     pub attachments_downloaded: u64,
+    pub bytes_processed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -151,11 +160,86 @@ impl SyncTarget {
             newest_message_id: None,
             oldest_message_id: None,
             historical_complete: false,
+            archived_message_count: Some(0),
+            archived_byte_count: Some(0),
         });
         checkpoint
             .targets
             .last_mut()
             .expect("checkpoint target should exist after push")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SyncGuildPlan {
+    guild: GuildInfo,
+    channels: Vec<GuildChannel>,
+    channel_targets: Vec<SyncTarget>,
+    thread_targets: Vec<SyncTarget>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SyncWorkDelta {
+    messages_written: u64,
+    attachments_downloaded: u64,
+    bytes_processed: u64,
+}
+
+impl SyncWorkDelta {
+    fn add_assign(&mut self, other: Self) {
+        self.messages_written = self.messages_written.saturating_add(other.messages_written);
+        self.attachments_downloaded = self
+            .attachments_downloaded
+            .saturating_add(other.attachments_downloaded);
+        self.bytes_processed = self.bytes_processed.saturating_add(other.bytes_processed);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SyncProgressMetrics {
+    targets_total: u64,
+    targets_completed: u64,
+    resumed_targets: u64,
+    messages_processed: u64,
+    bytes_processed: u64,
+    estimated_messages_total: u64,
+    estimated_messages_remaining: u64,
+    estimated_bytes_total: u64,
+    estimated_bytes_remaining: u64,
+    message_rate_per_sec: u64,
+    bytes_rate_per_sec: u64,
+    progress_percent: u64,
+    eta_seconds: u64,
+    eta_known: bool,
+}
+
+#[derive(Debug)]
+struct SyncProgressTracker {
+    started_at: Instant,
+    targets_total: u64,
+    resumed_targets: u64,
+    targets_completed: u64,
+}
+
+impl SyncProgressTracker {
+    fn new(targets: &[SyncTarget], checkpoint: &SyncCheckpoint) -> Self {
+        let resumed_targets = targets
+            .iter()
+            .filter(|target| {
+                checkpoint_state(checkpoint, target).is_some_and(target_has_resume_state)
+            })
+            .count();
+
+        Self {
+            started_at: Instant::now(),
+            targets_total: u64::try_from(targets.len()).unwrap_or(u64::MAX),
+            resumed_targets: u64::try_from(resumed_targets).unwrap_or(u64::MAX),
+            targets_completed: 0,
+        }
+    }
+
+    fn mark_target_complete(&mut self) {
+        self.targets_completed = self.targets_completed.saturating_add(1);
     }
 }
 
@@ -177,6 +261,199 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut hex, "{byte:02x}");
     }
     hex
+}
+
+fn snowflake_timestamp_millis(snowflake_id: u64) -> i64 {
+    i64::try_from(snowflake_id >> 22)
+        .unwrap_or(i64::MAX)
+        .saturating_add(DISCORD_EPOCH_MILLIS)
+}
+
+fn checkpoint_state<'a>(
+    checkpoint: &'a SyncCheckpoint,
+    target: &SyncTarget,
+) -> Option<&'a SyncTargetCheckpoint> {
+    checkpoint.targets.iter().find(|candidate| {
+        candidate.guild_id == target.guild_id.get() && candidate.channel_id == target.channel_id()
+    })
+}
+
+fn checkpoint_archived_messages(state: Option<&SyncTargetCheckpoint>) -> u64 {
+    state
+        .and_then(|candidate| candidate.archived_message_count)
+        .unwrap_or(0)
+}
+
+fn checkpoint_archived_bytes(state: Option<&SyncTargetCheckpoint>) -> u64 {
+    state
+        .and_then(|candidate| candidate.archived_byte_count)
+        .unwrap_or(0)
+}
+
+fn target_has_resume_state(state: &SyncTargetCheckpoint) -> bool {
+    state.newest_message_id.is_some()
+        || state.oldest_message_id.is_some()
+        || state.historical_complete
+        || state.archived_message_count.unwrap_or(0) > 0
+        || state.archived_byte_count.unwrap_or(0) > 0
+}
+
+fn estimate_target_total_messages(
+    target: &SyncTarget,
+    state: Option<&SyncTargetCheckpoint>,
+    fallback_messages_per_target: u64,
+) -> u64 {
+    let processed_messages = checkpoint_archived_messages(state);
+    let Some(state) = state else {
+        return fallback_messages_per_target.max(1);
+    };
+
+    if state.historical_complete {
+        return processed_messages.max(1);
+    }
+
+    let Some(newest_id) = state.newest_message_id else {
+        return processed_messages.saturating_add(fallback_messages_per_target.max(1));
+    };
+    let Some(oldest_id) = state.oldest_message_id else {
+        return processed_messages.saturating_add(fallback_messages_per_target.max(1));
+    };
+
+    if processed_messages < MIN_ESTIMATION_SAMPLE_MESSAGES {
+        return processed_messages.saturating_add(fallback_messages_per_target.max(1));
+    }
+
+    let newest_ts = snowflake_timestamp_millis(newest_id);
+    let oldest_ts = snowflake_timestamp_millis(oldest_id);
+    let channel_start_ts = snowflake_timestamp_millis(target.channel_id());
+    let observed_span = newest_ts.saturating_sub(oldest_ts);
+    if observed_span <= 0 {
+        return processed_messages.saturating_add(fallback_messages_per_target.max(1));
+    }
+
+    let remaining_span =
+        u64::try_from(oldest_ts.saturating_sub(channel_start_ts).max(0)).unwrap_or(u64::MAX);
+    let observed_span = u64::try_from(observed_span).unwrap_or(1);
+    let estimated_historical_remaining = u64::try_from(
+        u128::from(processed_messages).saturating_mul(u128::from(remaining_span))
+            / u128::from(observed_span),
+    )
+    .unwrap_or(u64::MAX);
+
+    processed_messages
+        .saturating_add(estimated_historical_remaining)
+        .max(processed_messages.saturating_add(1))
+}
+
+fn estimate_target_total_bytes(
+    processed_messages: u64,
+    processed_bytes: u64,
+    estimated_total_messages: u64,
+    fallback_bytes_per_message: u64,
+) -> u64 {
+    if estimated_total_messages == 0 {
+        return 0;
+    }
+
+    if processed_messages == 0 || processed_bytes == 0 {
+        return estimated_total_messages.saturating_mul(fallback_bytes_per_message.max(1));
+    }
+
+    let average_bytes_per_message = (processed_bytes / processed_messages).max(1);
+    estimated_total_messages.saturating_mul(average_bytes_per_message)
+}
+
+fn overall_progress_metrics(
+    targets: &[SyncTarget],
+    checkpoint: &SyncCheckpoint,
+    tracker: &SyncProgressTracker,
+) -> SyncProgressMetrics {
+    let observed_messages = targets
+        .iter()
+        .map(|target| checkpoint_archived_messages(checkpoint_state(checkpoint, target)))
+        .sum::<u64>();
+    let observed_bytes = targets
+        .iter()
+        .map(|target| checkpoint_archived_bytes(checkpoint_state(checkpoint, target)))
+        .sum::<u64>();
+    let started_target_count = targets
+        .iter()
+        .filter(|target| checkpoint_state(checkpoint, target).is_some())
+        .count();
+
+    let fallback_messages_per_target = if started_target_count == 0 {
+        FALLBACK_ESTIMATED_MESSAGES_PER_TARGET
+    } else {
+        (observed_messages / u64::try_from(started_target_count).unwrap_or(1))
+            .max(FALLBACK_ESTIMATED_MESSAGES_PER_TARGET)
+    };
+    let fallback_bytes_per_message = if observed_messages == 0 {
+        FALLBACK_ESTIMATED_BYTES_PER_MESSAGE
+    } else {
+        (observed_bytes / observed_messages).max(FALLBACK_ESTIMATED_BYTES_PER_MESSAGE)
+    };
+
+    let mut estimated_messages_total = 0_u64;
+    let mut estimated_bytes_total = 0_u64;
+    for target in targets {
+        let state = checkpoint_state(checkpoint, target);
+        let processed_messages = checkpoint_archived_messages(state);
+        let processed_bytes = checkpoint_archived_bytes(state);
+        let estimated_total_messages =
+            estimate_target_total_messages(target, state, fallback_messages_per_target);
+        estimated_messages_total =
+            estimated_messages_total.saturating_add(estimated_total_messages);
+        estimated_bytes_total = estimated_bytes_total.saturating_add(estimate_target_total_bytes(
+            processed_messages,
+            processed_bytes,
+            estimated_total_messages,
+            fallback_bytes_per_message,
+        ));
+    }
+
+    let estimated_messages_remaining = estimated_messages_total.saturating_sub(observed_messages);
+    let estimated_bytes_remaining = estimated_bytes_total.saturating_sub(observed_bytes);
+    let elapsed_seconds = tracker.started_at.elapsed().as_secs().max(1);
+    let message_rate_per_sec = observed_messages / elapsed_seconds;
+    let bytes_rate_per_sec = observed_bytes / elapsed_seconds;
+    let eta_known = message_rate_per_sec > 0;
+    let eta_seconds = if eta_known {
+        estimated_messages_remaining / message_rate_per_sec.max(1)
+    } else {
+        0
+    };
+    let progress_percent = if estimated_messages_total > 0 {
+        u64::try_from(
+            u128::from(observed_messages).saturating_mul(100)
+                / u128::from(estimated_messages_total),
+        )
+        .unwrap_or(100)
+    } else if tracker.targets_total > 0 {
+        u64::try_from(
+            u128::from(tracker.targets_completed).saturating_mul(100)
+                / u128::from(tracker.targets_total),
+        )
+        .unwrap_or(100)
+    } else {
+        100
+    };
+
+    SyncProgressMetrics {
+        targets_total: tracker.targets_total,
+        targets_completed: tracker.targets_completed,
+        resumed_targets: tracker.resumed_targets,
+        messages_processed: observed_messages,
+        bytes_processed: observed_bytes,
+        estimated_messages_total,
+        estimated_messages_remaining,
+        estimated_bytes_total,
+        estimated_bytes_remaining,
+        message_rate_per_sec,
+        bytes_rate_per_sec,
+        progress_percent,
+        eta_seconds,
+        eta_known,
+    }
 }
 
 fn attachments_root(output_root: &Path) -> PathBuf {
@@ -227,33 +504,34 @@ fn load_checkpoint(layout: &SyncStateLayout) -> eyre::Result<SyncCheckpoint> {
     Ok(checkpoint)
 }
 
-fn write_text_file(path: &Path, contents: &str) -> eyre::Result<()> {
+fn write_text_file(path: &Path, contents: &str) -> eyre::Result<u64> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     std::fs::write(path, contents)
         .wrap_err_with(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    Ok(u64::try_from(contents.len()).unwrap_or(u64::MAX))
 }
 
-fn write_binary_file(path: &Path, contents: &[u8]) -> eyre::Result<()> {
+fn write_binary_file(path: &Path, contents: &[u8]) -> eyre::Result<u64> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     std::fs::write(path, contents)
         .wrap_err_with(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    Ok(u64::try_from(contents.len()).unwrap_or(u64::MAX))
 }
 
 fn save_checkpoint(layout: &SyncStateLayout, checkpoint: &SyncCheckpoint) -> eyre::Result<()> {
     let contents =
         facet_json::to_string_pretty(checkpoint).wrap_err("Failed to serialize sync checkpoint")?;
-    write_text_file(&layout.checkpoint_path, &contents)
+    let _ = write_text_file(&layout.checkpoint_path, &contents)?;
+    Ok(())
 }
 
-fn write_raw_json_file<T>(path: &Path, value: &T) -> eyre::Result<()>
+fn write_raw_json_file<T>(path: &Path, value: &T) -> eyre::Result<u64>
 where
     T: serde::Serialize,
 {
@@ -262,7 +540,7 @@ where
     write_text_file(path, &contents)
 }
 
-fn write_facet_json_file<'facet, T>(path: &Path, value: &T) -> eyre::Result<()>
+fn write_facet_json_file<'facet, T>(path: &Path, value: &T) -> eyre::Result<u64>
 where
     T: facet::Facet<'facet> + ?Sized,
 {
@@ -288,7 +566,7 @@ fn load_attachment_index(path: &Path) -> eyre::Result<Option<ArchivedAttachmentI
 async fn archive_attachment(
     output_root: &Path,
     attachment: &serenity::all::Attachment,
-) -> eyre::Result<(ArchivedAttachmentReference, bool)> {
+) -> eyre::Result<(ArchivedAttachmentReference, SyncWorkDelta)> {
     let index_path = attachment_index_path(output_root, attachment.id.get());
     if let Some(index) = load_attachment_index(&index_path)? {
         let blob_path = output_root.join(&index.blob_path);
@@ -302,7 +580,7 @@ async fn archive_attachment(
                     blob_path: index.blob_path,
                     sha256: index.sha256,
                 },
-                false,
+                SyncWorkDelta::default(),
             ));
         }
     }
@@ -314,9 +592,13 @@ async fn archive_attachment(
     let sha256 = sha256_hex(&bytes);
     let blob_relative_path = attachment_blob_relative_path(&sha256);
     let blob_path = attachment_blob_path(output_root, &sha256);
+    let mut delta = SyncWorkDelta::default();
     let blob_was_missing = !blob_path.exists();
     if blob_was_missing {
-        write_binary_file(&blob_path, &bytes)?;
+        delta.bytes_processed = delta
+            .bytes_processed
+            .saturating_add(write_binary_file(&blob_path, &bytes)?);
+        delta.attachments_downloaded = 1;
     }
 
     let index = ArchivedAttachmentIndex {
@@ -327,7 +609,9 @@ async fn archive_attachment(
         size: attachment.size,
         content_type: attachment.content_type.clone(),
     };
-    write_facet_json_file(&index_path, &index)?;
+    delta.bytes_processed = delta
+        .bytes_processed
+        .saturating_add(write_facet_json_file(&index_path, &index)?);
 
     Ok((
         ArchivedAttachmentReference {
@@ -338,7 +622,7 @@ async fn archive_attachment(
             blob_path: blob_relative_path,
             sha256,
         },
-        blob_was_missing,
+        delta,
     ))
 }
 
@@ -347,17 +631,16 @@ async fn archive_message(
     output_root: &Path,
     target: &SyncTarget,
     message: &Message,
-) -> eyre::Result<(ArchivedMessageRecord, u64)> {
+) -> eyre::Result<(ArchivedMessageRecord, SyncWorkDelta)> {
     let raw_json = serde_json::to_string_pretty(message)
         .wrap_err_with(|| format!("Failed to serialize raw message {}", message.id.get()))?;
     let mut archived_attachments = Vec::new();
-    let mut downloaded_count = 0;
+    let mut delta = SyncWorkDelta::default();
     for attachment in &message.attachments {
-        let (archived_attachment, downloaded) = archive_attachment(output_root, attachment).await?;
+        let (archived_attachment, attachment_delta) =
+            archive_attachment(output_root, attachment).await?;
         archived_attachments.push(archived_attachment);
-        if downloaded {
-            downloaded_count += 1;
-        }
+        delta.add_assign(attachment_delta);
     }
 
     Ok((
@@ -371,7 +654,7 @@ async fn archive_message(
             raw_json,
             attachments: archived_attachments,
         },
-        downloaded_count,
+        delta,
     ))
 }
 
@@ -388,22 +671,22 @@ async fn write_message_page(
     output_root: &Path,
     target: &SyncTarget,
     messages: &[Message],
-) -> eyre::Result<(u64, u64)> {
+) -> eyre::Result<SyncWorkDelta> {
     let messages_dir = target.messages_dir(output_root);
     std::fs::create_dir_all(&messages_dir)
         .wrap_err_with(|| format!("Failed to create {}", messages_dir.display()))?;
 
-    let mut messages_written = 0;
-    let mut attachments_downloaded = 0;
+    let mut delta = SyncWorkDelta::default();
     for message in messages {
-        let (record, downloaded_count) = archive_message(output_root, target, message).await?;
+        let (record, message_delta) = archive_message(output_root, target, message).await?;
         let message_path = messages_dir.join(format!("{}.json", message.id.get()));
-        write_facet_json_file(&message_path, &record)?;
-        messages_written += 1;
-        attachments_downloaded += downloaded_count;
+        let record_bytes = write_facet_json_file(&message_path, &record)?;
+        delta.add_assign(message_delta);
+        delta.messages_written = delta.messages_written.saturating_add(1);
+        delta.bytes_processed = delta.bytes_processed.saturating_add(record_bytes);
     }
 
-    Ok((messages_written, attachments_downloaded))
+    Ok(delta)
 }
 
 async fn fetch_messages_before(
@@ -435,16 +718,168 @@ async fn fetch_messages_after(
         .wrap_err_with(|| format!("Failed to list messages for channel {}", channel_id.get()))
 }
 
+// archive[impl sync.progress.structured-logging]
+fn log_target_started(
+    tracker: &SyncProgressTracker,
+    checkpoint: &SyncCheckpoint,
+    target: &SyncTarget,
+    target_index: usize,
+) {
+    let state = checkpoint_state(checkpoint, target);
+    let resumed = state.is_some_and(target_has_resume_state);
+    tracing::info!(
+        event = "sync.target.start",
+        guild_id = target.guild_id.get(),
+        channel_id = target.channel_id(),
+        parent_channel_id = target.parent_channel_id(),
+        is_thread = target.is_thread,
+        target_index = target_index + 1,
+        total_targets = tracker.targets_total,
+        resumed,
+        historical_complete = state.is_some_and(|candidate| candidate.historical_complete),
+        checkpoint_messages = checkpoint_archived_messages(state),
+        checkpoint_bytes = checkpoint_archived_bytes(state),
+        newest_message_id = state
+            .and_then(|candidate| candidate.newest_message_id)
+            .unwrap_or(0),
+        oldest_message_id = state
+            .and_then(|candidate| candidate.oldest_message_id)
+            .unwrap_or(0),
+        "sync target started"
+    );
+}
+
+// archive[impl sync.progress.estimated-telemetry]
+fn log_sync_progress(
+    tracker: &SyncProgressTracker,
+    targets: &[SyncTarget],
+    checkpoint: &SyncCheckpoint,
+    target: &SyncTarget,
+    target_index: usize,
+    phase: &str,
+    delta: SyncWorkDelta,
+) {
+    let metrics = overall_progress_metrics(targets, checkpoint, tracker);
+    tracing::info!(
+        event = "sync.progress",
+        phase,
+        guild_id = target.guild_id.get(),
+        channel_id = target.channel_id(),
+        parent_channel_id = target.parent_channel_id(),
+        is_thread = target.is_thread,
+        target_index = target_index + 1,
+        total_targets = metrics.targets_total,
+        targets_completed = metrics.targets_completed,
+        resumed_targets = metrics.resumed_targets,
+        page_messages = delta.messages_written,
+        page_attachments_downloaded = delta.attachments_downloaded,
+        page_bytes_processed = delta.bytes_processed,
+        messages_processed = metrics.messages_processed,
+        bytes_processed = metrics.bytes_processed,
+        estimated_messages_total = metrics.estimated_messages_total,
+        estimated_messages_remaining = metrics.estimated_messages_remaining,
+        estimated_bytes_total = metrics.estimated_bytes_total,
+        estimated_bytes_remaining = metrics.estimated_bytes_remaining,
+        messages_per_second = metrics.message_rate_per_sec,
+        bytes_per_second = metrics.bytes_rate_per_sec,
+        eta_seconds = metrics.eta_seconds,
+        eta_known = metrics.eta_known,
+        progress_percent = metrics.progress_percent,
+        "sync progress updated"
+    );
+}
+
+fn log_sync_finished(
+    tracker: &SyncProgressTracker,
+    targets: &[SyncTarget],
+    checkpoint: &SyncCheckpoint,
+    summary: &SyncRunSummary,
+) {
+    let metrics = overall_progress_metrics(targets, checkpoint, tracker);
+    tracing::info!(
+        event = "sync.complete",
+        guilds_seen = summary.guilds_seen,
+        channels_seen = summary.channels_seen,
+        threads_seen = summary.threads_seen,
+        resumed_targets = summary.resumed_targets,
+        messages_written = summary.messages_written,
+        attachments_downloaded = summary.attachments_downloaded,
+        bytes_processed = summary.bytes_processed,
+        estimated_messages_total = metrics.estimated_messages_total,
+        estimated_bytes_total = metrics.estimated_bytes_total,
+        elapsed_seconds = tracker.started_at.elapsed().as_secs(),
+        "sync run completed"
+    );
+}
+
+async fn build_sync_plans(http: &Http, guilds: &[GuildInfo]) -> eyre::Result<Vec<SyncGuildPlan>> {
+    let mut plans = Vec::with_capacity(guilds.len());
+    for guild in guilds {
+        let channels = http
+            .get_channels(guild.id)
+            .await
+            .wrap_err_with(|| format!("Failed to list channels for guild {}", guild.id.get()))?;
+        let channel_targets = channels
+            .iter()
+            .filter(|channel| is_syncable_channel_kind(channel.kind))
+            .cloned()
+            .map(|channel| SyncTarget {
+                guild_id: guild.id,
+                channel,
+                is_thread: false,
+            })
+            .collect::<Vec<_>>();
+        let threads = http
+            .get_guild_active_threads(guild.id)
+            .await
+            .wrap_err_with(|| {
+                format!("Failed to list active threads for guild {}", guild.id.get())
+            })?;
+        let thread_targets = threads
+            .threads
+            .into_iter()
+            .map(|channel| SyncTarget {
+                guild_id: guild.id,
+                channel,
+                is_thread: true,
+            })
+            .collect::<Vec<_>>();
+
+        plans.push(SyncGuildPlan {
+            guild: guild.clone(),
+            channels,
+            channel_targets,
+            thread_targets,
+        });
+    }
+    Ok(plans)
+}
+
+fn flatten_sync_targets(plans: &[SyncGuildPlan]) -> Vec<SyncTarget> {
+    let mut targets = Vec::new();
+    for plan in plans {
+        targets.extend(plan.channel_targets.iter().cloned());
+        targets.extend(plan.thread_targets.iter().cloned());
+    }
+    targets
+}
+
 // archive[impl sync.resume-from-checkpoint]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "sync page telemetry needs the current run context"
+)]
 async fn sync_newer_messages(
     http: &Http,
     output_root: &Path,
     layout: &SyncStateLayout,
     checkpoint: &mut SyncCheckpoint,
     target: &SyncTarget,
-) -> eyre::Result<(u64, u64)> {
-    let mut messages_written = 0;
-    let mut attachments_downloaded = 0;
+    tracker: &SyncProgressTracker,
+    targets: &[SyncTarget],
+    target_index: usize,
+) -> eyre::Result<SyncWorkDelta> {
+    let mut delta = SyncWorkDelta::default();
 
     loop {
         let after = {
@@ -460,10 +895,8 @@ async fn sync_newer_messages(
             break;
         }
 
-        let (page_messages_written, page_attachments_downloaded) =
-            write_message_page(output_root, target, &messages).await?;
-        messages_written += page_messages_written;
-        attachments_downloaded += page_attachments_downloaded;
+        let page_delta = write_message_page(output_root, target, &messages).await?;
+        delta.add_assign(page_delta);
 
         {
             let state = target.checkpoint(checkpoint);
@@ -474,27 +907,54 @@ async fn sync_newer_messages(
                 (None, page_oldest) => page_oldest,
                 (existing, None) => existing,
             };
+            state.archived_message_count = Some(
+                state
+                    .archived_message_count
+                    .unwrap_or(0)
+                    .saturating_add(page_delta.messages_written),
+            );
+            state.archived_byte_count = Some(
+                state
+                    .archived_byte_count
+                    .unwrap_or(0)
+                    .saturating_add(page_delta.bytes_processed),
+            );
         };
         save_checkpoint(layout, checkpoint)?;
+        log_sync_progress(
+            tracker,
+            targets,
+            checkpoint,
+            target,
+            target_index,
+            "newer-page",
+            page_delta,
+        );
 
         if messages.len() < usize::from(MESSAGE_PAGE_LIMIT) {
             break;
         }
     }
 
-    Ok((messages_written, attachments_downloaded))
+    Ok(delta)
 }
 
 // archive[impl sync.resume-from-checkpoint]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "sync page telemetry needs the current run context"
+)]
 async fn sync_historical_messages(
     http: &Http,
     output_root: &Path,
     layout: &SyncStateLayout,
     checkpoint: &mut SyncCheckpoint,
     target: &SyncTarget,
-) -> eyre::Result<(u64, u64)> {
-    let mut messages_written = 0;
-    let mut attachments_downloaded = 0;
+    tracker: &SyncProgressTracker,
+    targets: &[SyncTarget],
+    target_index: usize,
+) -> eyre::Result<SyncWorkDelta> {
+    let mut delta = SyncWorkDelta::default();
 
     loop {
         let (historical_complete, before) = {
@@ -512,10 +972,8 @@ async fn sync_historical_messages(
             break;
         }
 
-        let (page_messages_written, page_attachments_downloaded) =
-            write_message_page(output_root, target, &messages).await?;
-        messages_written += page_messages_written;
-        attachments_downloaded += page_attachments_downloaded;
+        let page_delta = write_message_page(output_root, target, &messages).await?;
+        delta.add_assign(page_delta);
 
         {
             let state = target.checkpoint(checkpoint);
@@ -531,91 +989,209 @@ async fn sync_historical_messages(
                 (None, page_oldest) => page_oldest,
                 (existing, None) => existing,
             };
+            state.archived_message_count = Some(
+                state
+                    .archived_message_count
+                    .unwrap_or(0)
+                    .saturating_add(page_delta.messages_written),
+            );
+            state.archived_byte_count = Some(
+                state
+                    .archived_byte_count
+                    .unwrap_or(0)
+                    .saturating_add(page_delta.bytes_processed),
+            );
         };
         save_checkpoint(layout, checkpoint)?;
+        log_sync_progress(
+            tracker,
+            targets,
+            checkpoint,
+            target,
+            target_index,
+            "historical-page",
+            page_delta,
+        );
     }
 
-    Ok((messages_written, attachments_downloaded))
+    Ok(delta)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "target sync needs both resume state and telemetry context"
+)]
 async fn sync_target(
     http: &Http,
     output_root: &Path,
     layout: &SyncStateLayout,
     checkpoint: &mut SyncCheckpoint,
     target: &SyncTarget,
-) -> eyre::Result<(u64, u64)> {
-    write_raw_json_file(&target.metadata_path(output_root), &target.channel)?;
-    let (new_messages_written, new_attachments_downloaded) =
-        sync_newer_messages(http, output_root, layout, checkpoint, target).await?;
-    let (historical_messages_written, historical_attachments_downloaded) =
-        sync_historical_messages(http, output_root, layout, checkpoint, target).await?;
-    Ok((
-        new_messages_written + historical_messages_written,
-        new_attachments_downloaded + historical_attachments_downloaded,
-    ))
+    tracker: &SyncProgressTracker,
+    targets: &[SyncTarget],
+    target_index: usize,
+) -> eyre::Result<SyncWorkDelta> {
+    let mut delta = SyncWorkDelta::default();
+    delta.bytes_processed = delta.bytes_processed.saturating_add(write_raw_json_file(
+        &target.metadata_path(output_root),
+        &target.channel,
+    )?);
+    delta.add_assign(
+        sync_newer_messages(
+            http,
+            output_root,
+            layout,
+            checkpoint,
+            target,
+            tracker,
+            targets,
+            target_index,
+        )
+        .await?,
+    );
+    delta.add_assign(
+        sync_historical_messages(
+            http,
+            output_root,
+            layout,
+            checkpoint,
+            target,
+            tracker,
+            targets,
+            target_index,
+        )
+        .await?,
+    );
+    Ok(delta)
 }
 
 // archive[impl sync.writes-output-files]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "guild sync coordinates plan data, checkpoint state, and telemetry state"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the per-guild sync flow is clearer when kept in one place"
+)]
 async fn sync_guild(
     http: &Http,
     output_root: &Path,
     layout: &SyncStateLayout,
     checkpoint: &mut SyncCheckpoint,
-    guild: &GuildInfo,
+    plan: &SyncGuildPlan,
+    targets: &[SyncTarget],
+    tracker: &mut SyncProgressTracker,
+    next_target_index: &mut usize,
     summary: &mut SyncRunSummary,
 ) -> eyre::Result<()> {
-    write_raw_json_file(&guild_metadata_path(output_root, guild.id), guild)?;
-    let channels = http
-        .get_channels(guild.id)
-        .await
-        .wrap_err_with(|| format!("Failed to list channels for guild {}", guild.id.get()))?;
+    summary.bytes_processed = summary.bytes_processed.saturating_add(write_raw_json_file(
+        &guild_metadata_path(output_root, plan.guild.id),
+        &plan.guild,
+    )?);
 
-    for channel in &channels {
-        write_raw_json_file(
+    for channel in &plan.channels {
+        summary.bytes_processed = summary.bytes_processed.saturating_add(write_raw_json_file(
             &SyncTarget {
-                guild_id: guild.id,
+                guild_id: plan.guild.id,
                 channel: channel.clone(),
                 is_thread: false,
             }
             .metadata_path(output_root),
             channel,
-        )?;
+        )?);
     }
 
-    let channel_targets = channels
-        .into_iter()
-        .filter(|channel| is_syncable_channel_kind(channel.kind))
-        .map(|channel| SyncTarget {
-            guild_id: guild.id,
-            channel,
-            is_thread: false,
-        })
-        .collect::<Vec<_>>();
-    summary.channels_seen += u64::try_from(channel_targets.len()).unwrap_or(u64::MAX);
-
-    for target in channel_targets {
-        let (messages_written, attachments_downloaded) =
-            sync_target(http, output_root, layout, checkpoint, &target).await?;
-        summary.messages_written += messages_written;
-        summary.attachments_downloaded += attachments_downloaded;
+    summary.channels_seen = summary
+        .channels_seen
+        .saturating_add(u64::try_from(plan.channel_targets.len()).unwrap_or(u64::MAX));
+    for target in &plan.channel_targets {
+        let target_span = tracing::info_span!(
+            "sync_target",
+            guild_id = target.guild_id.get(),
+            channel_id = target.channel_id(),
+            parent_channel_id = target.parent_channel_id(),
+            is_thread = target.is_thread
+        );
+        let _target_guard = target_span.enter();
+        log_target_started(tracker, checkpoint, target, *next_target_index);
+        let target_delta = sync_target(
+            http,
+            output_root,
+            layout,
+            checkpoint,
+            target,
+            tracker,
+            targets,
+            *next_target_index,
+        )
+        .await?;
+        summary.messages_written = summary
+            .messages_written
+            .saturating_add(target_delta.messages_written);
+        summary.attachments_downloaded = summary
+            .attachments_downloaded
+            .saturating_add(target_delta.attachments_downloaded);
+        summary.bytes_processed = summary
+            .bytes_processed
+            .saturating_add(target_delta.bytes_processed);
+        log_sync_progress(
+            tracker,
+            targets,
+            checkpoint,
+            target,
+            *next_target_index,
+            "target-complete",
+            target_delta,
+        );
+        tracker.mark_target_complete();
+        *next_target_index += 1;
     }
 
-    let threads = http
-        .get_guild_active_threads(guild.id)
-        .await
-        .wrap_err_with(|| format!("Failed to list active threads for guild {}", guild.id.get()))?;
-    summary.threads_seen += u64::try_from(threads.threads.len()).unwrap_or(u64::MAX);
-    for thread in threads.threads {
-        let target = SyncTarget {
-            guild_id: guild.id,
-            channel: thread,
-            is_thread: true,
-        };
-        let (messages_written, attachments_downloaded) =
-            sync_target(http, output_root, layout, checkpoint, &target).await?;
-        summary.messages_written += messages_written;
-        summary.attachments_downloaded += attachments_downloaded;
+    summary.threads_seen = summary
+        .threads_seen
+        .saturating_add(u64::try_from(plan.thread_targets.len()).unwrap_or(u64::MAX));
+    for target in &plan.thread_targets {
+        let target_span = tracing::info_span!(
+            "sync_target",
+            guild_id = target.guild_id.get(),
+            channel_id = target.channel_id(),
+            parent_channel_id = target.parent_channel_id(),
+            is_thread = target.is_thread
+        );
+        let _target_guard = target_span.enter();
+        log_target_started(tracker, checkpoint, target, *next_target_index);
+        let target_delta = sync_target(
+            http,
+            output_root,
+            layout,
+            checkpoint,
+            target,
+            tracker,
+            targets,
+            *next_target_index,
+        )
+        .await?;
+        summary.messages_written = summary
+            .messages_written
+            .saturating_add(target_delta.messages_written);
+        summary.attachments_downloaded = summary
+            .attachments_downloaded
+            .saturating_add(target_delta.attachments_downloaded);
+        summary.bytes_processed = summary
+            .bytes_processed
+            .saturating_add(target_delta.bytes_processed);
+        log_sync_progress(
+            tracker,
+            targets,
+            checkpoint,
+            target,
+            *next_target_index,
+            "target-complete",
+            target_delta,
+        );
+        tracker.mark_target_complete();
+        *next_target_index += 1;
     }
 
     Ok(())
@@ -638,23 +1214,50 @@ pub async fn run_sync(
     }
 
     let guilds = crate::discord::live::list_guilds(&http).await?;
+    let plans = build_sync_plans(&http, &guilds).await?;
+    let targets = flatten_sync_targets(&plans);
+    let tracker = &mut SyncProgressTracker::new(&targets, &checkpoint);
     let mut summary = SyncRunSummary {
         output_dir: output_root.display().to_string(),
         checkpoint_path: layout.checkpoint_path.display().to_string(),
         guilds_seen: u64::try_from(guilds.len()).unwrap_or(u64::MAX),
         channels_seen: 0,
         threads_seen: 0,
+        resumed_targets: tracker.resumed_targets,
         messages_written: 0,
         attachments_downloaded: 0,
+        bytes_processed: 0,
     };
 
-    for guild in guilds {
+    let run_span = tracing::info_span!(
+        "sync_run",
+        output_dir = %output_root.display(),
+        checkpoint_path = %layout.checkpoint_path.display(),
+        total_guilds = summary.guilds_seen,
+        total_targets = tracker.targets_total,
+        resumed_targets = tracker.resumed_targets
+    );
+    let _run_guard = run_span.enter();
+    tracing::info!(
+        event = "sync.start",
+        checkpoint_targets = checkpoint.targets.len(),
+        total_guilds = summary.guilds_seen,
+        total_targets = tracker.targets_total,
+        resumed_targets = tracker.resumed_targets,
+        "sync run started"
+    );
+
+    let mut next_target_index = 0_usize;
+    for plan in &plans {
         sync_guild(
             &http,
             output_root,
             layout,
             &mut checkpoint,
-            &guild,
+            plan,
+            &targets,
+            tracker,
+            &mut next_target_index,
             &mut summary,
         )
         .await?;
@@ -662,6 +1265,7 @@ pub async fn run_sync(
     }
 
     save_checkpoint(layout, &checkpoint)?;
+    log_sync_finished(tracker, &targets, &checkpoint, &summary);
     Ok(summary)
 }
 
@@ -670,13 +1274,17 @@ mod tests {
     use super::ArchivedAttachmentIndex;
     use super::CHECKPOINT_VERSION;
     use super::SyncCheckpoint;
+    use super::SyncProgressTracker;
     use super::SyncTarget;
     use super::SyncTargetCheckpoint;
     use super::attachment_blob_relative_path;
     use super::attachment_index_path;
     use super::attachments_root;
+    use super::checkpoint_state;
+    use super::estimate_target_total_messages;
     use super::load_attachment_index;
     use super::load_checkpoint;
+    use super::overall_progress_metrics;
     use super::save_checkpoint;
     use crate::paths::CacheHome;
     use crate::paths::ensure_sync_state_layout;
@@ -684,7 +1292,29 @@ mod tests {
     use serenity::all::ChannelType;
     use serenity::all::GuildChannel;
     use serenity::all::GuildId;
+    use std::time::Instant;
     use tempfile::tempdir;
+
+    fn test_target(channel_id: u64, guild_id: u64, is_thread: bool) -> SyncTarget {
+        let channel_type = if is_thread { 11 } else { 0 };
+        let channel: GuildChannel = serde_json::from_value(serde_json::json!({
+            "id": channel_id.to_string(),
+            "type": channel_type,
+            "guild_id": guild_id.to_string(),
+            "name": format!("channel-{channel_id}"),
+            "position": 0,
+            "permission_overwrites": [],
+            "nsfw": false,
+            "parent_id": serde_json::Value::Null
+        }))
+        .expect("guild channel should deserialize");
+
+        SyncTarget {
+            guild_id: GuildId::new(guild_id),
+            channel,
+            is_thread,
+        }
+    }
 
     #[test]
     // archive[verify attachments.deduplicated-store]
@@ -714,6 +1344,8 @@ mod tests {
                 newest_message_id: Some(4),
                 oldest_message_id: Some(5),
                 historical_complete: true,
+                archived_message_count: Some(6),
+                archived_byte_count: Some(7),
             }],
         };
 
@@ -786,5 +1418,83 @@ mod tests {
         );
         assert_eq!(target.channel.kind, ChannelType::PublicThread);
         assert_eq!(target.channel.id, ChannelId::new(11));
+    }
+
+    #[test]
+    // archive[verify sync.progress.structured-logging]
+    fn checkpoint_state_detects_resume_progress_for_target() {
+        let target = test_target(11, 99, false);
+        let checkpoint = SyncCheckpoint {
+            version: CHECKPOINT_VERSION,
+            targets: vec![SyncTargetCheckpoint {
+                guild_id: 99,
+                channel_id: 11,
+                parent_channel_id: None,
+                newest_message_id: Some(22),
+                oldest_message_id: Some(11),
+                historical_complete: false,
+                archived_message_count: Some(50),
+                archived_byte_count: Some(8192),
+            }],
+        };
+
+        let state = checkpoint_state(&checkpoint, &target).expect("target state should exist");
+        assert!(super::target_has_resume_state(state));
+    }
+
+    #[test]
+    // archive[verify sync.progress.estimated-telemetry]
+    fn estimate_target_total_messages_uses_checkpoint_density() {
+        let target = test_target(1_300_000_000_000_000_000, 99, false);
+        let state = SyncTargetCheckpoint {
+            guild_id: 99,
+            channel_id: target.channel_id(),
+            parent_channel_id: None,
+            newest_message_id: Some(1_400_000_000_000_000_000),
+            oldest_message_id: Some(1_350_000_000_000_000_000),
+            historical_complete: false,
+            archived_message_count: Some(200),
+            archived_byte_count: Some(200 * 4096),
+        };
+
+        let estimate = estimate_target_total_messages(&target, Some(&state), 100);
+        assert!(estimate > 200);
+    }
+
+    #[test]
+    // archive[verify sync.progress.estimated-telemetry]
+    fn overall_progress_metrics_reports_rates_and_remaining_estimates() {
+        let targets = vec![
+            test_target(1_300_000_000_000_000_000, 99, false),
+            test_target(1_300_000_000_100_000_000, 99, false),
+        ];
+        let checkpoint = SyncCheckpoint {
+            version: CHECKPOINT_VERSION,
+            targets: vec![SyncTargetCheckpoint {
+                guild_id: 99,
+                channel_id: targets[0].channel_id(),
+                parent_channel_id: None,
+                newest_message_id: Some(1_400_000_000_000_000_000),
+                oldest_message_id: Some(1_350_000_000_000_000_000),
+                historical_complete: false,
+                archived_message_count: Some(200),
+                archived_byte_count: Some(200 * 4096),
+            }],
+        };
+        let tracker = SyncProgressTracker {
+            started_at: Instant::now() - std::time::Duration::from_secs(10),
+            targets_total: 2,
+            resumed_targets: 1,
+            targets_completed: 0,
+        };
+
+        let metrics = overall_progress_metrics(&targets, &checkpoint, &tracker);
+        assert_eq!(metrics.resumed_targets, 1);
+        assert_eq!(metrics.messages_processed, 200);
+        assert!(metrics.estimated_messages_total >= metrics.messages_processed);
+        assert!(metrics.estimated_messages_remaining > 0);
+        assert!(metrics.bytes_processed > 0);
+        assert!(metrics.message_rate_per_sec > 0);
+        assert!(metrics.eta_known);
     }
 }
