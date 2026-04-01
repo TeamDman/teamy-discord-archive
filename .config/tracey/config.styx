@@ -27,6 +27,9 @@ specs (
                 name rust
                 include (src/**/*.rs)
                 test_include (tests/**/*.rs)
+                include_plain (
+                    check-all.ps1
+                )
             }
         )
     }
