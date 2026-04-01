@@ -73,6 +73,7 @@ impl LiveAttachmentRecord {
 ///
 /// This function will return an error if the before value is not a valid RFC3339 timestamp
 /// or if it predates the Discord epoch.
+// archive[impl cursor.before-datetime]
 pub fn parse_before_datetime(before: Option<&str>) -> eyre::Result<Option<DateTime<Utc>>> {
     before
         .map(|value| {
@@ -119,6 +120,7 @@ pub fn normalize_message_limit(limit: Option<u8>) -> u8 {
 /// # Errors
 ///
 /// This function will return an error if the API call fails.
+// archive[impl goal.live-api-probing]
 pub async fn list_guilds(http: &Http) -> eyre::Result<Vec<GuildInfo>> {
     let mut guilds = Vec::new();
     let mut cursor = None;
@@ -163,6 +165,7 @@ mod tests {
     use chrono::Utc;
 
     #[test]
+    // cli[verify live.message.target-selection]
     fn resolve_message_target_requires_exactly_one_id() {
         assert!(resolve_message_target(None, None).is_err());
         assert!(resolve_message_target(Some(1), Some(2)).is_err());
@@ -175,6 +178,7 @@ mod tests {
     }
 
     #[test]
+    // archive[verify cursor.before-datetime]
     fn before_datetime_to_message_id_is_monotonic() {
         let earlier = Utc
             .timestamp_millis_opt(DISCORD_EPOCH_MILLIS + 1_000)
@@ -196,6 +200,7 @@ mod tests {
     }
 
     #[test]
+    // archive[verify cursor.before-datetime]
     fn parse_before_datetime_accepts_rfc3339() {
         let parsed = parse_before_datetime(Some("2024-01-01T00:00:00Z"))
             .expect("timestamp should parse")

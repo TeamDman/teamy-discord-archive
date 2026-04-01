@@ -14,6 +14,7 @@ pub struct LiveThreadArgs {
 }
 
 /// Thread subcommands.
+// cli[impl command.surface.live-thread]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum LiveThreadCommand {

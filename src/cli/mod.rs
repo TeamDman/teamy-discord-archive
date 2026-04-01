@@ -68,6 +68,7 @@ impl Cli {
 }
 
 /// The archive CLI command surface.
+// cli[impl command.surface.core]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Command {
@@ -84,6 +85,7 @@ pub enum Command {
     /// Output directory preference commands.
     OutputDir(OutputDirArgs),
     /// Synchronize Discord content into the configured output directory.
+    // cli[impl command.surface.sync]
     Sync(SyncArgs),
 }
 

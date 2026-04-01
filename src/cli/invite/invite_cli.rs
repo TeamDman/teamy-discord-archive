@@ -22,6 +22,7 @@ pub struct InviteArgs {
 }
 
 #[must_use]
+// cli[impl invite.prints-url]
 fn build_invite_url(application_id: ApplicationId) -> String {
     CreateBotAuthParameters::new()
         .client_id(application_id)
@@ -34,6 +35,8 @@ impl InviteArgs {
     ///
     /// This function will return an error if the token cannot be resolved,
     /// the Discord API call fails, or the browser cannot be opened.
+    // cli[impl auth.invite-token-resolution]
+    // cli[impl invite.opens-browser-by-default]
     pub async fn invoke(self) -> Result<()> {
         let resolved = crate::paths::resolve_bot_token(self.token.as_deref())?;
         let http = Http::new(&resolved.token);
@@ -60,6 +63,7 @@ mod tests {
     use serenity::all::ApplicationId;
 
     #[test]
+    // cli[verify invite.prints-url]
     fn invite_url_contains_client_id_and_bot_scope() {
         let invite_url = build_invite_url(ApplicationId::new(123456789012345678));
 

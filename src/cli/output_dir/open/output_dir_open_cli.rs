@@ -12,6 +12,7 @@ impl OutputDirOpenArgs {
     ///
     /// This function will return an error if no output directory has been configured,
     /// if the directory cannot be created, or if the file manager cannot be launched.
+    // cli[impl path.output-dir.open-resolves-effective]
     #[expect(clippy::unused_async)]
     pub async fn invoke(self) -> Result<()> {
         let resolved = crate::paths::require_output_dir(None)?;

@@ -16,6 +16,7 @@ pub struct BotTokenArgs {
 }
 
 /// Discord bot token subcommands.
+// cli[impl command.surface.bot-token]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum BotTokenCommand {

@@ -19,7 +19,7 @@ The current implementation focuses on the first local-first pieces of the archiv
 - a top-level invite command that prints and optionally opens the bot invite URL
 - read-only live Discord API inspection commands powered by serenity HTTP
 - persisted output directory preferences with environment-variable override
-- an initial `sync` command scaffold that resolves and prepares the effective output target
+- a resumable `sync` command that archives guild metadata, message payloads, and attachments to the output directory
 
 ## Quick Start
 
@@ -123,6 +123,12 @@ Print the bot invite URL without opening the browser:
 
 ```powershell
 cargo run -- invite --no-open
+```
+
+Run a resumable archive sync after configuring the output directory and token:
+
+```powershell
+cargo run -- sync
 ```
 
 Override the persisted output directory with an environment variable:

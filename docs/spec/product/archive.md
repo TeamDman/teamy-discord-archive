@@ -11,6 +11,12 @@ The archiver must treat the configured output directory as a filesystem target w
 archive[goal.resumable-sync-entrypoint]
 The product must center the historical archival workflow around a resumable `sync` command.
 
+archive[sync.writes-output-files]
+The `sync` command must write archived guild, channel, thread, message, and attachment data under the configured output directory.
+
+archive[sync.resume-from-checkpoint]
+The `sync` command must persist per-target cursors so that interrupted runs can resume rather than restarting from scratch.
+
 archive[goal.live-api-probing]
 The product must provide a live-query command surface for inspecting Discord API behavior separately from archived data queries.
 

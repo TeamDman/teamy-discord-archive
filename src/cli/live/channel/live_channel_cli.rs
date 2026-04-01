@@ -14,6 +14,7 @@ pub struct LiveChannelArgs {
 }
 
 /// Channel subcommands.
+// cli[impl command.surface.live-channel]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum LiveChannelCommand {

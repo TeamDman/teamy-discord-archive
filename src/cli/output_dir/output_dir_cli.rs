@@ -15,6 +15,7 @@ pub struct OutputDirArgs {
 }
 
 /// Output directory subcommands.
+// cli[impl command.surface.output-dir]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum OutputDirCommand {

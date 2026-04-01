@@ -15,6 +15,7 @@ impl OutputDirSetArgs {
     /// # Errors
     ///
     /// This function will return an error if the preference cannot be written.
+    // cli[impl path.output-dir.set-persists-default]
     pub fn persist(self, app_home: &crate::paths::AppHome) -> Result<()> {
         let path = std::path::PathBuf::from(self.path);
         crate::paths::save_output_dir_preference(app_home, path.as_path())?;

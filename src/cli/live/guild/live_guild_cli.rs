@@ -14,6 +14,7 @@ pub struct LiveGuildArgs {
 }
 
 /// Guild subcommands.
+// cli[impl command.surface.live-guild]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum LiveGuildCommand {

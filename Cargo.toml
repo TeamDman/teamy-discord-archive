@@ -28,6 +28,7 @@ tokio = { version = "1.49.0", features = ["full"] }
 facet = "0.44.1"
 figue = { package = "teamy-figue", version = "2.0.1", features = ["arbitrary"] }
 open = "5"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 teamy-windows = "0.9.0"

@@ -14,6 +14,7 @@ pub struct LiveUserArgs {
 }
 
 /// User subcommands.
+// cli[impl command.surface.live-user]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum LiveUserCommand {

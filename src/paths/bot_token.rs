@@ -66,6 +66,7 @@ pub fn load_bot_token_preference(app_home: &AppHome) -> eyre::Result<Option<Stri
 ///
 /// This function will return an error if the preference directory or file cannot be written,
 /// or if the token is blank.
+// cli[impl auth.bot-token.set-persists-default]
 pub fn save_bot_token_preference(app_home: &AppHome, token: &str) -> eyre::Result<()> {
     let Some(token) = normalize_token_text(token) else {
         bail!("Discord bot token must not be empty")
@@ -85,6 +86,7 @@ pub fn save_bot_token_preference(app_home: &AppHome, token: &str) -> eyre::Resul
 /// # Errors
 ///
 /// This function will return an error if removing the saved preference fails.
+// cli[impl auth.bot-token.clear-removes-preference]
 pub fn clear_bot_token_preference(app_home: &AppHome) -> eyre::Result<bool> {
     let preference_path = bot_token_preference_path(app_home);
     if !preference_path.exists() {
@@ -106,6 +108,9 @@ pub fn load_bot_token_from_environment_value(value: Option<&str>) -> Option<Stri
 }
 
 #[must_use]
+// cli[impl auth.live-token.command-line-overrides-env]
+// cli[impl auth.live-token.env]
+// cli[impl auth.live-token.preference-fallback]
 pub fn resolve_bot_token_from_sources(
     command_line: Option<String>,
     environment: Option<String>,
@@ -179,6 +184,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    // cli[verify auth.live-token.command-line-overrides-env]
     fn token_resolution_prefers_command_line() {
         let resolved = resolve_bot_token_from_sources(
             Some("cli-token".to_owned()),
@@ -192,6 +198,7 @@ mod tests {
     }
 
     #[test]
+    // cli[verify auth.live-token.env]
     fn token_resolution_prefers_environment_over_preference() {
         let resolved = resolve_bot_token_from_sources(
             None,
@@ -205,6 +212,7 @@ mod tests {
     }
 
     #[test]
+    // cli[verify auth.live-token.preference-fallback]
     fn token_resolution_uses_saved_preference_last() {
         let resolved = resolve_bot_token_from_sources(None, None, Some("saved-token".to_owned()))
             .expect("saved token should resolve");
@@ -219,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    // cli[verify auth.bot-token.set-persists-default]
     fn token_preference_roundtrips_on_disk() {
         let temp_dir = tempdir().expect("tempdir should be created");
         let app_home = AppHome(temp_dir.path().join("home"));
@@ -248,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    // cli[verify auth.bot-token.clear-removes-preference]
     fn clear_bot_token_preference_removes_saved_token() {
         let temp_dir = tempdir().expect("tempdir should be created");
         let app_home = AppHome(temp_dir.path().join("home"));

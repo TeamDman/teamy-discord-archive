@@ -23,20 +23,27 @@ pub struct LiveArgs {
 }
 
 /// Nested live Discord queries.
+// cli[impl command.surface.live]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum LiveCommand {
     /// List attachments visible through the API.
+    // cli[impl command.surface.live-attachment]
     Attachment(LiveAttachmentArgs),
     /// List channels visible in a guild.
+    // cli[impl command.surface.live-channel]
     Channel(LiveChannelArgs),
     /// List guilds visible to the bot.
+    // cli[impl command.surface.live-guild]
     Guild(LiveGuildArgs),
     /// List messages visible in a channel or thread.
+    // cli[impl command.surface.live-message]
     Message(LiveMessageArgs),
     /// List active threads visible in a guild.
+    // cli[impl command.surface.live-thread]
     Thread(LiveThreadArgs),
     /// List users visible in a guild.
+    // cli[impl command.surface.live-user]
     User(LiveUserArgs),
 }
 
@@ -44,6 +51,9 @@ impl LiveArgs {
     /// # Errors
     ///
     /// This function will return an error if the Discord token cannot be resolved or the subcommand fails.
+    // cli[impl auth.live-token.command-line-overrides-env]
+    // cli[impl auth.live-token.env]
+    // cli[impl auth.live-token.preference-fallback]
     pub async fn invoke(self) -> Result<()> {
         let resolved = crate::paths::resolve_bot_token(self.token.as_deref())?;
         let config = crate::discord::live::LiveDiscordClientConfig {

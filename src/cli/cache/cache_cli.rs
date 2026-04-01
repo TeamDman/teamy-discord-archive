@@ -15,6 +15,7 @@ pub struct CacheArgs {
 }
 
 /// Cache subcommands.
+// cli[impl command.surface.cache]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum CacheCommand {

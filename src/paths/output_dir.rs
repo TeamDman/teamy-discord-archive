@@ -65,6 +65,7 @@ pub fn load_output_dir_preference(app_home: &AppHome) -> eyre::Result<Option<Pat
 /// # Errors
 ///
 /// This function will return an error if the preference directory or file cannot be written.
+// cli[impl path.output-dir.set-persists-default]
 pub fn save_output_dir_preference(app_home: &AppHome, output_dir: &Path) -> eyre::Result<()> {
     app_home.ensure_dir()?;
     let preference_path = output_dir_preference_path(app_home);
@@ -78,6 +79,8 @@ pub fn save_output_dir_preference(app_home: &AppHome, output_dir: &Path) -> eyre
 }
 
 #[must_use]
+// cli[impl path.output-dir.command-line-overrides-env]
+// cli[impl path.output-dir.env-overrides-preference]
 pub fn resolve_output_dir_from_sources(
     command_line: Option<PathBuf>,
     environment: Option<PathBuf>,
@@ -184,6 +187,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    // cli[verify path.output-dir.command-line-overrides-env]
     fn output_dir_resolution_prefers_command_line() {
         let resolved = resolve_output_dir_from_sources(
             Some(PathBuf::from("cli")),
@@ -197,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    // cli[verify path.output-dir.env-overrides-preference]
     fn output_dir_resolution_prefers_environment_over_preference() {
         let resolved = resolve_output_dir_from_sources(
             None,
@@ -229,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    // cli[verify path.output-dir.set-persists-default]
     fn output_dir_preference_roundtrips_on_disk() {
         let temp_dir = tempdir().expect("tempdir should be created");
         let app_home = AppHome(temp_dir.path().join("home"));

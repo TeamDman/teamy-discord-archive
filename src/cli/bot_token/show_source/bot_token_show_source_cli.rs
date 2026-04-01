@@ -25,6 +25,7 @@ impl BotTokenShowSourceArgs {
     /// # Errors
     ///
     /// This function will return an error if reading the saved preference fails.
+    // cli[impl auth.bot-token.show-source-resolves-effective]
     #[expect(clippy::unused_async)]
     pub async fn invoke(self) -> Result<()> {
         let app_home = &crate::paths::APP_HOME;

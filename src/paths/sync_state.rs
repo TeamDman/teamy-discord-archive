@@ -17,6 +17,7 @@ pub struct SyncStateLayout {
 }
 
 #[must_use]
+// archive[impl state.checkpoints-in-cache]
 pub fn sync_state_root(cache_home: &CacheHome) -> PathBuf {
     cache_home.0.join(SYNC_STATE_ROOT_DIR)
 }
@@ -42,6 +43,7 @@ pub fn sync_target_key(output_root: &Path) -> String {
 }
 
 #[must_use]
+// archive[impl state.per-output-root-isolated]
 pub fn sync_target_state_dir(cache_home: &CacheHome, output_root: &Path) -> PathBuf {
     sync_targets_dir(cache_home).join(sync_target_key(output_root))
 }
@@ -87,10 +89,12 @@ mod tests {
     use super::ensure_sync_state_layout;
     use super::sync_state_layout;
     use crate::paths::CacheHome;
+    use std::path::Path;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
+    // archive[verify state.checkpoints-in-cache]
     fn sync_state_layout_places_state_under_cache() {
         let temp_dir = tempdir().expect("tempdir should be created");
         let cache_home = CacheHome(temp_dir.path().join("cache"));
@@ -111,6 +115,7 @@ mod tests {
     }
 
     #[test]
+    // archive[verify state.checkpoints-in-cache]
     fn ensure_sync_state_layout_creates_target_dir() {
         let temp_dir = tempdir().expect("tempdir should be created");
         let cache_home = CacheHome(temp_dir.path().join("cache"));
@@ -121,5 +126,17 @@ mod tests {
 
         assert!(layout.target_dir.exists());
         assert!(layout.target_dir.is_dir());
+    }
+
+    #[test]
+    // archive[verify state.per-output-root-isolated]
+    fn sync_target_state_dir_is_unique_per_output_root() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let cache_home = CacheHome(temp_dir.path().join("cache"));
+
+        let first = super::sync_target_state_dir(&cache_home, Path::new("C:/archive/one"));
+        let second = super::sync_target_state_dir(&cache_home, Path::new("C:/archive/two"));
+
+        assert_ne!(first, second);
     }
 }

@@ -14,6 +14,7 @@ pub struct HomeArgs {
 }
 
 /// Home subcommands.
+// cli[impl command.surface.home]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum HomeCommand {

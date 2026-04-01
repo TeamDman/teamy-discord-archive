@@ -16,6 +16,7 @@ impl BotTokenSetArgs {
     /// # Errors
     ///
     /// This function will return an error if no token can be resolved or the preference cannot be written.
+    // cli[impl auth.bot-token.set-env-fallback]
     pub fn persist(
         self,
         app_home: &crate::paths::AppHome,
@@ -60,6 +61,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    // cli[verify auth.bot-token.set-env-fallback]
     fn persist_uses_environment_when_argument_is_missing() {
         let temp_dir = tempdir().expect("tempdir should be created");
         let app_home = AppHome(temp_dir.path().join("home"));

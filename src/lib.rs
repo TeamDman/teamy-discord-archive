@@ -1,6 +1,7 @@
 #![deny(clippy::disallowed_methods)]
 #![deny(clippy::disallowed_macros)]
 
+pub mod archive;
 pub mod cli;
 pub mod discord;
 pub mod json_stdout;

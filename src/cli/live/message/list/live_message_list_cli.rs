@@ -31,6 +31,8 @@ impl LiveMessageListArgs {
     /// # Errors
     ///
     /// This function will return an error if argument resolution fails or the Discord API call fails.
+    // cli[impl live.message.before-flag]
+    // cli[impl live.message.target-selection]
     pub async fn invoke(self, http: &Http) -> Result<()> {
         let target = crate::discord::live::resolve_message_target(self.channel_id, self.thread_id)?;
         let before = crate::discord::live::parse_before_datetime(self.before.as_deref())?;

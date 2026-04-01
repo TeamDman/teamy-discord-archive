@@ -17,6 +17,7 @@ impl BotTokenClearArgs {
     /// # Errors
     ///
     /// This function will return an error if removing the saved preference fails.
+    // cli[impl auth.bot-token.clear-removes-preference]
     #[expect(clippy::unused_async)]
     pub async fn invoke(self) -> Result<()> {
         let removed = crate::paths::clear_bot_token_preference(&crate::paths::APP_HOME)?;

@@ -26,6 +26,7 @@ impl BotTokenValidateArgs {
     /// # Errors
     ///
     /// This function will return an error if the token cannot be resolved or the Discord API rejects it.
+    // cli[impl auth.bot-token.validate-resolves-effective]
     pub async fn invoke(self) -> Result<()> {
         let resolved = crate::paths::resolve_bot_token(self.token.as_deref())?;
         let http = serenity::all::Http::new(&resolved.token);

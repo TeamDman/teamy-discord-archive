@@ -113,6 +113,9 @@ The `output-dir set <path>` command must persist the default output directory in
 cli[sync.requires-output-dir]
 The `sync` command must fail with a clear configuration error if no effective output directory can be resolved from command line arguments, environment variables, or persisted configuration.
 
+cli[sync.requires-token]
+The `sync` command must fail with a clear configuration error if no effective Discord bot token can be resolved from command line arguments, environment variables, or persisted configuration.
+
 cli[live.message.before-flag]
 The `live message list` command must support a `--before <rfc3339>` flag to query messages before a cursor timestamp.
 

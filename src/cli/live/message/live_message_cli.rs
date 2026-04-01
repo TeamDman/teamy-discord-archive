@@ -14,6 +14,7 @@ pub struct LiveMessageArgs {
 }
 
 /// Message subcommands.
+// cli[impl command.surface.live-message]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum LiveMessageCommand {

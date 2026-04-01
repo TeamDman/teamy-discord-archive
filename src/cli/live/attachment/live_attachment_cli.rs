@@ -14,6 +14,7 @@ pub struct LiveAttachmentArgs {
 }
 
 /// Attachment subcommands.
+// cli[impl command.surface.live-attachment]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum LiveAttachmentCommand {
