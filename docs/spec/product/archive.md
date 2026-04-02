@@ -29,6 +29,9 @@ The product must support reconstructing sync checkpoint target cursors and count
 archive[sync.checkpoint.restore-compares-existing]
 When restoring a checkpoint, the product must compare the reconstructed checkpoint against an existing checkpoint if one is present.
 
+archive[sync.checkpoint.auto-restore-when-missing]
+If the sync checkpoint file is missing, the `sync` command must reconstruct and persist a replacement checkpoint from archived output before continuing.
+
 archive[goal.live-api-probing]
 The product must provide a live-query command surface for inspecting Discord API behavior separately from archived data queries.
 

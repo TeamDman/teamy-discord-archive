@@ -885,6 +885,28 @@ pub fn restore_checkpoint_from_output(
     })
 }
 
+// archive[impl sync.checkpoint.auto-restore-when-missing]
+/// # Errors
+///
+/// This function will return an error if checkpoint reconstruction fails or the restored checkpoint cannot be saved.
+fn ensure_checkpoint_for_sync(output_root: &Path, layout: &SyncStateLayout) -> eyre::Result<bool> {
+    if layout.checkpoint_path.exists() {
+        return Ok(false);
+    }
+
+    let restored = restore_checkpoint_from_output(output_root, layout, false)?;
+    tracing::info!(
+        event = "sync.checkpoint.restored",
+        checkpoint_path = %layout.checkpoint_path.display(),
+        restored_target_count = restored.restored_target_count,
+        restored_message_count = restored.restored_message_count,
+        restored_byte_count = restored.restored_byte_count,
+        byte_count_strategy = restored.byte_count_strategy,
+        "restored missing checkpoint from archived output"
+    );
+    Ok(true)
+}
+
 fn load_checkpoint(layout: &SyncStateLayout) -> eyre::Result<SyncCheckpoint> {
     if !layout.checkpoint_path.exists() {
         return Ok(SyncCheckpoint {
@@ -1699,6 +1721,7 @@ pub async fn run_sync(
     token: &str,
 ) -> eyre::Result<SyncRunSummary> {
     let http = Http::new(token);
+    let _checkpoint_restored = ensure_checkpoint_for_sync(output_root, layout)?;
     let mut checkpoint = load_checkpoint(layout)?;
     if checkpoint.version == 0 {
         checkpoint.version = CHECKPOINT_VERSION;
@@ -1772,6 +1795,7 @@ mod tests {
     use super::attachment_index_path;
     use super::attachments_root;
     use super::checkpoint_state;
+    use super::ensure_checkpoint_for_sync;
     use super::estimate_target_total_messages;
     use super::is_missing_access_error_code;
     use super::load_attachment_index;
@@ -2021,6 +2045,73 @@ mod tests {
         );
 
         let loaded = load_checkpoint(&layout).expect("existing checkpoint should still load");
+        assert_eq!(loaded, existing);
+    }
+
+    #[test]
+    // archive[verify sync.checkpoint.auto-restore-when-missing]
+    fn ensure_checkpoint_for_sync_restores_when_checkpoint_is_missing() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let output_root = temp_dir.path().join("output");
+        let cache_home = CacheHome(temp_dir.path().join("cache"));
+        let layout = ensure_sync_state_layout(&cache_home, &output_root)
+            .expect("sync state layout should exist");
+
+        let channel_root = output_root
+            .join("guilds")
+            .join("99")
+            .join("channels")
+            .join("10");
+        std::fs::create_dir_all(channel_root.join("messages"))
+            .expect("channel messages dir should exist");
+        std::fs::write(channel_root.join("channel.json"), "{}")
+            .expect("channel metadata should write");
+        std::fs::write(channel_root.join("messages").join("20.json"), "abcd")
+            .expect("message should write");
+
+        if layout.checkpoint_path.exists() {
+            std::fs::remove_file(&layout.checkpoint_path).expect("checkpoint should be removed");
+        }
+
+        let restored = ensure_checkpoint_for_sync(&output_root, &layout)
+            .expect("checkpoint restore should succeed");
+
+        assert!(restored);
+        let loaded = load_checkpoint(&layout).expect("restored checkpoint should load");
+        assert_eq!(loaded.targets.len(), 1);
+        assert_eq!(loaded.targets[0].guild_id, 99);
+        assert_eq!(loaded.targets[0].channel_id, 10);
+        assert_eq!(loaded.targets[0].archived_message_count, Some(1));
+    }
+
+    #[test]
+    // archive[verify sync.checkpoint.auto-restore-when-missing]
+    fn ensure_checkpoint_for_sync_leaves_existing_checkpoint_unchanged() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let output_root = temp_dir.path().join("output");
+        let cache_home = CacheHome(temp_dir.path().join("cache"));
+        let layout = ensure_sync_state_layout(&cache_home, &output_root)
+            .expect("sync state layout should exist");
+        let existing = SyncCheckpoint {
+            version: CHECKPOINT_VERSION,
+            targets: vec![SyncTargetCheckpoint {
+                guild_id: 99,
+                channel_id: 10,
+                parent_channel_id: None,
+                newest_message_id: Some(123),
+                oldest_message_id: Some(45),
+                historical_complete: true,
+                archived_message_count: Some(7),
+                archived_byte_count: Some(99),
+            }],
+        };
+        save_checkpoint(&layout, &existing).expect("existing checkpoint should save");
+
+        let restored = ensure_checkpoint_for_sync(&output_root, &layout)
+            .expect("checkpoint preflight should succeed");
+
+        assert!(!restored);
+        let loaded = load_checkpoint(&layout).expect("existing checkpoint should load");
         assert_eq!(loaded, existing);
     }
 
