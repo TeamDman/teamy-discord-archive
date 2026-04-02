@@ -94,6 +94,40 @@ pub struct SyncRunSummary {
     pub bytes_processed: u64,
 }
 
+#[derive(Facet, Clone, Debug, PartialEq, Eq)]
+#[facet(rename_all = "kebab-case")]
+pub struct SyncCheckpointComparisonEntry {
+    pub guild_id: u64,
+    pub channel_id: u64,
+    pub parent_channel_id: Option<u64>,
+    pub existing: Option<SyncTargetCheckpoint>,
+    pub restored: Option<SyncTargetCheckpoint>,
+}
+
+#[derive(Facet, Clone, Debug, PartialEq, Eq)]
+#[facet(rename_all = "kebab-case")]
+pub struct SyncCheckpointComparison {
+    pub matching_targets: u64,
+    pub missing_from_existing: u64,
+    pub missing_from_restored: u64,
+    pub differing_targets: Vec<SyncCheckpointComparisonEntry>,
+}
+
+#[derive(Facet, Clone, Debug, PartialEq, Eq)]
+#[facet(rename_all = "kebab-case")]
+pub struct SyncCheckpointRestoreSummary {
+    pub output_dir: String,
+    pub checkpoint_path: String,
+    pub dry_run: bool,
+    pub existing_checkpoint_found: bool,
+    pub restored_target_count: u64,
+    pub restored_message_count: u64,
+    pub restored_byte_count: u64,
+    pub byte_count_strategy: String,
+    pub restored_checkpoint: SyncCheckpoint,
+    pub comparison: Option<SyncCheckpointComparison>,
+}
+
 #[derive(Clone, Debug)]
 struct SyncTarget {
     guild_id: GuildId,
@@ -525,6 +559,330 @@ fn guild_metadata_path(output_root: &Path, guild_id: GuildId) -> PathBuf {
         .join("guilds")
         .join(guild_id.get().to_string())
         .join("guild.json")
+}
+
+fn sorted_directory_entries(path: &Path) -> eyre::Result<Vec<std::fs::DirEntry>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = std::fs::read_dir(path)
+        .wrap_err_with(|| format!("Failed to read directory {}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .wrap_err_with(|| format!("Failed to list directory {}", path.display()))?;
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().into_owned());
+    Ok(entries)
+}
+
+fn numeric_name(path: &Path) -> Option<u64> {
+    path.file_name()?.to_str()?.parse().ok()
+}
+
+fn numeric_json_stem(path: &Path) -> Option<u64> {
+    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+        return None;
+    }
+    path.file_stem()?.to_str()?.parse().ok()
+}
+
+fn scan_target_checkpoint(
+    guild_id: u64,
+    channel_id: u64,
+    parent_channel_id: Option<u64>,
+    messages_dir: &Path,
+) -> eyre::Result<SyncTargetCheckpoint> {
+    let mut newest_message_id = None;
+    let mut oldest_message_id = None;
+    let mut archived_message_count = 0_u64;
+    let mut archived_byte_count = 0_u64;
+
+    for entry in sorted_directory_entries(messages_dir)? {
+        let entry_path = entry.path();
+        if !entry
+            .file_type()
+            .wrap_err_with(|| format!("Failed to inspect {}", entry_path.display()))?
+            .is_file()
+        {
+            continue;
+        }
+
+        let Some(message_id) = numeric_json_stem(&entry_path) else {
+            continue;
+        };
+
+        archived_message_count = archived_message_count.saturating_add(1);
+        archived_byte_count = archived_byte_count
+            .saturating_add(entry.metadata().map(|metadata| metadata.len()).unwrap_or(0));
+        newest_message_id =
+            Some(newest_message_id.map_or(message_id, |current: u64| current.max(message_id)));
+        oldest_message_id =
+            Some(oldest_message_id.map_or(message_id, |current: u64| current.min(message_id)));
+    }
+
+    Ok(SyncTargetCheckpoint {
+        guild_id,
+        channel_id,
+        parent_channel_id,
+        newest_message_id,
+        oldest_message_id,
+        historical_complete: false,
+        archived_message_count: Some(archived_message_count),
+        archived_byte_count: Some(archived_byte_count),
+    })
+}
+
+fn should_restore_target(root_dir: &Path, metadata_file_name: &str) -> bool {
+    root_dir.join(metadata_file_name).exists() || root_dir.join("messages").exists()
+}
+
+// archive[impl sync.checkpoint.reconstruct-from-output]
+/// # Errors
+///
+/// This function will return an error if archived guild/channel/thread directories cannot be read.
+pub fn reconstruct_checkpoint_from_output(output_root: &Path) -> eyre::Result<SyncCheckpoint> {
+    let guilds_dir = output_root.join("guilds");
+    let mut targets = Vec::new();
+
+    for guild_entry in sorted_directory_entries(&guilds_dir)? {
+        let guild_path = guild_entry.path();
+        if !guild_entry
+            .file_type()
+            .wrap_err_with(|| format!("Failed to inspect {}", guild_path.display()))?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let Some(guild_id) = numeric_name(&guild_path) else {
+            tracing::warn!(path = %guild_path.display(), "skipping non-numeric guild directory during checkpoint reconstruction");
+            continue;
+        };
+
+        let channels_dir = guild_path.join("channels");
+        for channel_entry in sorted_directory_entries(&channels_dir)? {
+            let channel_path = channel_entry.path();
+            if !channel_entry
+                .file_type()
+                .wrap_err_with(|| format!("Failed to inspect {}", channel_path.display()))?
+                .is_dir()
+            {
+                continue;
+            }
+
+            let Some(channel_id) = numeric_name(&channel_path) else {
+                tracing::warn!(path = %channel_path.display(), "skipping non-numeric channel directory during checkpoint reconstruction");
+                continue;
+            };
+
+            if should_restore_target(&channel_path, "channel.json") {
+                targets.push(scan_target_checkpoint(
+                    guild_id,
+                    channel_id,
+                    None,
+                    &channel_path.join("messages"),
+                )?);
+            }
+
+            let threads_dir = channel_path.join("threads");
+            for thread_entry in sorted_directory_entries(&threads_dir)? {
+                let thread_path = thread_entry.path();
+                if !thread_entry
+                    .file_type()
+                    .wrap_err_with(|| format!("Failed to inspect {}", thread_path.display()))?
+                    .is_dir()
+                {
+                    continue;
+                }
+
+                let Some(thread_id) = numeric_name(&thread_path) else {
+                    tracing::warn!(path = %thread_path.display(), "skipping non-numeric thread directory during checkpoint reconstruction");
+                    continue;
+                };
+
+                if should_restore_target(&thread_path, "thread.json") {
+                    targets.push(scan_target_checkpoint(
+                        guild_id,
+                        thread_id,
+                        Some(channel_id),
+                        &thread_path.join("messages"),
+                    )?);
+                }
+            }
+        }
+
+        let orphan_threads_dir = guild_path.join("orphan-threads");
+        for thread_entry in sorted_directory_entries(&orphan_threads_dir)? {
+            let thread_path = thread_entry.path();
+            if !thread_entry
+                .file_type()
+                .wrap_err_with(|| format!("Failed to inspect {}", thread_path.display()))?
+                .is_dir()
+            {
+                continue;
+            }
+
+            let Some(thread_id) = numeric_name(&thread_path) else {
+                tracing::warn!(path = %thread_path.display(), "skipping non-numeric orphan-thread directory during checkpoint reconstruction");
+                continue;
+            };
+
+            if should_restore_target(&thread_path, "thread.json") {
+                targets.push(scan_target_checkpoint(
+                    guild_id,
+                    thread_id,
+                    None,
+                    &thread_path.join("messages"),
+                )?);
+            }
+        }
+    }
+
+    targets.sort_by_key(|target| {
+        (
+            target.guild_id,
+            target.parent_channel_id.unwrap_or(0),
+            target.channel_id,
+        )
+    });
+
+    Ok(SyncCheckpoint {
+        version: CHECKPOINT_VERSION,
+        targets,
+    })
+}
+
+fn compare_checkpoints(
+    existing: &SyncCheckpoint,
+    restored: &SyncCheckpoint,
+) -> SyncCheckpointComparison {
+    let existing_map = existing
+        .targets
+        .iter()
+        .map(|target| {
+            (
+                (target.guild_id, target.channel_id, target.parent_channel_id),
+                target,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let restored_map = restored
+        .targets
+        .iter()
+        .map(|target| {
+            (
+                (target.guild_id, target.channel_id, target.parent_channel_id),
+                target,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut matching_targets = 0_u64;
+    let mut missing_from_existing = 0_u64;
+    let mut missing_from_restored = 0_u64;
+    let mut differing_targets = Vec::new();
+
+    let keys = existing_map
+        .keys()
+        .chain(restored_map.keys())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for (guild_id, channel_id, parent_channel_id) in keys {
+        let existing_target = existing_map.get(&(guild_id, channel_id, parent_channel_id));
+        let restored_target = restored_map.get(&(guild_id, channel_id, parent_channel_id));
+
+        match (existing_target, restored_target) {
+            (Some(existing_target), Some(restored_target))
+                if *existing_target == *restored_target =>
+            {
+                matching_targets = matching_targets.saturating_add(1);
+            }
+            (None, Some(restored_target)) => {
+                missing_from_existing = missing_from_existing.saturating_add(1);
+                differing_targets.push(SyncCheckpointComparisonEntry {
+                    guild_id,
+                    channel_id,
+                    parent_channel_id,
+                    existing: None,
+                    restored: Some((*restored_target).clone()),
+                });
+            }
+            (Some(existing_target), None) => {
+                missing_from_restored = missing_from_restored.saturating_add(1);
+                differing_targets.push(SyncCheckpointComparisonEntry {
+                    guild_id,
+                    channel_id,
+                    parent_channel_id,
+                    existing: Some((*existing_target).clone()),
+                    restored: None,
+                });
+            }
+            (Some(existing_target), Some(restored_target)) => {
+                differing_targets.push(SyncCheckpointComparisonEntry {
+                    guild_id,
+                    channel_id,
+                    parent_channel_id,
+                    existing: Some((*existing_target).clone()),
+                    restored: Some((*restored_target).clone()),
+                });
+            }
+            (None, None) => {}
+        }
+    }
+
+    SyncCheckpointComparison {
+        matching_targets,
+        missing_from_existing,
+        missing_from_restored,
+        differing_targets,
+    }
+}
+
+// archive[impl sync.checkpoint.restore-compares-existing]
+/// # Errors
+///
+/// This function will return an error if the existing checkpoint cannot be loaded,
+/// the archived output cannot be scanned, or the reconstructed checkpoint cannot be saved.
+pub fn restore_checkpoint_from_output(
+    output_root: &Path,
+    layout: &SyncStateLayout,
+    dry_run: bool,
+) -> eyre::Result<SyncCheckpointRestoreSummary> {
+    let existing_checkpoint_found = layout.checkpoint_path.exists();
+    let existing_checkpoint = if existing_checkpoint_found {
+        Some(load_checkpoint(layout)?)
+    } else {
+        None
+    };
+    let restored_checkpoint = reconstruct_checkpoint_from_output(output_root)?;
+    let comparison = existing_checkpoint
+        .as_ref()
+        .map(|existing| compare_checkpoints(existing, &restored_checkpoint));
+
+    if !dry_run {
+        save_checkpoint(layout, &restored_checkpoint)?;
+    }
+
+    Ok(SyncCheckpointRestoreSummary {
+        output_dir: output_root.display().to_string(),
+        checkpoint_path: layout.checkpoint_path.display().to_string(),
+        dry_run,
+        existing_checkpoint_found,
+        restored_target_count: u64::try_from(restored_checkpoint.targets.len()).unwrap_or(u64::MAX),
+        restored_message_count: restored_checkpoint
+            .targets
+            .iter()
+            .map(|target| target.archived_message_count.unwrap_or(0))
+            .sum(),
+        restored_byte_count: restored_checkpoint
+            .targets
+            .iter()
+            .map(|target| target.archived_byte_count.unwrap_or(0))
+            .sum(),
+        byte_count_strategy: "message-record-files-only".to_owned(),
+        restored_checkpoint,
+        comparison,
+    })
 }
 
 fn load_checkpoint(layout: &SyncStateLayout) -> eyre::Result<SyncCheckpoint> {
@@ -1419,6 +1777,8 @@ mod tests {
     use super::load_attachment_index;
     use super::load_checkpoint;
     use super::overall_progress_metrics;
+    use super::reconstruct_checkpoint_from_output;
+    use super::restore_checkpoint_from_output;
     use super::save_checkpoint;
     use crate::paths::CacheHome;
     use crate::paths::ensure_sync_state_layout;
@@ -1559,6 +1919,109 @@ mod tests {
         assert_eq!(target.guild_name(), "guild-99");
         assert_eq!(target.channel_name(), "parent-channel");
         assert_eq!(target.thread_name(), "thread-name");
+    }
+
+    #[test]
+    // archive[verify sync.checkpoint.reconstruct-from-output]
+    fn reconstruct_checkpoint_from_output_scans_channel_and_thread_messages() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let output_root = temp_dir.path().join("output");
+
+        let channel_root = output_root
+            .join("guilds")
+            .join("99")
+            .join("channels")
+            .join("10");
+        std::fs::create_dir_all(channel_root.join("messages"))
+            .expect("channel messages dir should exist");
+        std::fs::write(channel_root.join("channel.json"), "{}")
+            .expect("channel metadata should write");
+        std::fs::write(channel_root.join("messages").join("20.json"), "abcd")
+            .expect("message should write");
+        std::fs::write(channel_root.join("messages").join("30.json"), "abcdef")
+            .expect("message should write");
+
+        let thread_root = channel_root.join("threads").join("11");
+        std::fs::create_dir_all(thread_root.join("messages"))
+            .expect("thread messages dir should exist");
+        std::fs::write(thread_root.join("thread.json"), "{}")
+            .expect("thread metadata should write");
+        std::fs::write(thread_root.join("messages").join("25.json"), "xyz")
+            .expect("thread message should write");
+
+        let checkpoint = reconstruct_checkpoint_from_output(&output_root)
+            .expect("checkpoint should reconstruct");
+
+        assert_eq!(checkpoint.targets.len(), 2);
+        assert_eq!(checkpoint.targets[0].guild_id, 99);
+        assert_eq!(checkpoint.targets[0].channel_id, 10);
+        assert_eq!(checkpoint.targets[0].parent_channel_id, None);
+        assert_eq!(checkpoint.targets[0].oldest_message_id, Some(20));
+        assert_eq!(checkpoint.targets[0].newest_message_id, Some(30));
+        assert_eq!(checkpoint.targets[0].archived_message_count, Some(2));
+        assert_eq!(checkpoint.targets[0].archived_byte_count, Some(10));
+        assert!(!checkpoint.targets[0].historical_complete);
+
+        assert_eq!(checkpoint.targets[1].channel_id, 11);
+        assert_eq!(checkpoint.targets[1].parent_channel_id, Some(10));
+        assert_eq!(checkpoint.targets[1].oldest_message_id, Some(25));
+        assert_eq!(checkpoint.targets[1].newest_message_id, Some(25));
+        assert_eq!(checkpoint.targets[1].archived_message_count, Some(1));
+    }
+
+    #[test]
+    // archive[verify sync.checkpoint.restore-compares-existing]
+    fn restore_checkpoint_from_output_dry_run_compares_existing_checkpoint() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let output_root = temp_dir.path().join("output");
+        let cache_home = CacheHome(temp_dir.path().join("cache"));
+        let layout = ensure_sync_state_layout(&cache_home, &output_root)
+            .expect("sync state layout should exist");
+
+        let channel_root = output_root
+            .join("guilds")
+            .join("99")
+            .join("channels")
+            .join("10");
+        std::fs::create_dir_all(channel_root.join("messages"))
+            .expect("channel messages dir should exist");
+        std::fs::write(channel_root.join("channel.json"), "{}")
+            .expect("channel metadata should write");
+        std::fs::write(channel_root.join("messages").join("20.json"), "abcd")
+            .expect("message should write");
+
+        let existing = SyncCheckpoint {
+            version: CHECKPOINT_VERSION,
+            targets: vec![SyncTargetCheckpoint {
+                guild_id: 99,
+                channel_id: 10,
+                parent_channel_id: None,
+                newest_message_id: Some(999),
+                oldest_message_id: Some(999),
+                historical_complete: true,
+                archived_message_count: Some(999),
+                archived_byte_count: Some(999),
+            }],
+        };
+        save_checkpoint(&layout, &existing).expect("existing checkpoint should save");
+
+        let summary = restore_checkpoint_from_output(&output_root, &layout, true)
+            .expect("dry-run restore should succeed");
+
+        assert!(summary.dry_run);
+        assert!(summary.existing_checkpoint_found);
+        assert_eq!(summary.restored_target_count, 1);
+        assert_eq!(
+            summary
+                .comparison
+                .expect("comparison should exist")
+                .differing_targets
+                .len(),
+            1
+        );
+
+        let loaded = load_checkpoint(&layout).expect("existing checkpoint should still load");
+        assert_eq!(loaded, existing);
     }
 
     #[test]

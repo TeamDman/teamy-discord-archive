@@ -23,6 +23,12 @@ The `sync` command must emit structured tracing progress updates suitable for li
 archive[sync.progress.estimated-telemetry]
 The `sync` command must report estimated progress telemetry during archival work, including messages-per-second, bytes processed, estimated remaining messages and bytes, and ETA values.
 
+archive[sync.checkpoint.reconstruct-from-output]
+The product must support reconstructing sync checkpoint target cursors and counts from archived output files without contacting Discord.
+
+archive[sync.checkpoint.restore-compares-existing]
+When restoring a checkpoint, the product must compare the reconstructed checkpoint against an existing checkpoint if one is present.
+
 archive[goal.live-api-probing]
 The product must provide a live-query command surface for inspecting Discord API behavior separately from archived data queries.
 

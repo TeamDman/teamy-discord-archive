@@ -44,7 +44,10 @@ cli[command.surface.live-user]
 The `live user` command group must expose the `list` subcommand.
 
 cli[command.surface.sync]
-The `sync` command must exist as the resumable archive entrypoint for future Discord archival work.
+The `sync` command must exist as the resumable archive entrypoint for future Discord archival work and expose the `checkpoint` subcommand group.
+
+cli[command.surface.sync-checkpoint]
+The `sync checkpoint` command group must expose the `restore` subcommand.
 
 ## Parser Model
 
@@ -115,6 +118,9 @@ The `sync` command must fail with a clear configuration error if no effective ou
 
 cli[sync.requires-token]
 The `sync` command must fail with a clear configuration error if no effective Discord bot token can be resolved from command line arguments, environment variables, or persisted configuration.
+
+cli[sync.checkpoint.restore.dry-run]
+The `sync checkpoint restore --dry-run` command must reconstruct a candidate checkpoint from archived output and print a comparison with any existing checkpoint without writing the checkpoint file.
 
 cli[live.message.before-flag]
 The `live message list` command must support a `--before <rfc3339>` flag to query messages before a cursor timestamp.

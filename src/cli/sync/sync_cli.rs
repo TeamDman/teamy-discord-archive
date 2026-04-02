@@ -15,12 +15,65 @@ pub struct SyncArgs {
     /// Override the output directory for this run.
     #[facet(args::named)]
     pub output_dir: Option<String>,
+
+    /// Optional sync subcommand.
+    #[facet(args::subcommand)]
+    pub command: Option<SyncCommand>,
+}
+
+/// Nested sync commands.
+// cli[impl command.surface.sync]
+#[derive(Facet, Arbitrary, Debug, PartialEq)]
+#[repr(u8)]
+pub enum SyncCommand {
+    /// Checkpoint maintenance commands.
+    // cli[impl command.surface.sync-checkpoint]
+    Checkpoint(SyncCheckpointArgs),
+}
+
+/// Sync checkpoint maintenance commands.
+#[derive(Facet, Arbitrary, Debug, PartialEq)]
+#[facet(rename_all = "kebab-case")]
+pub struct SyncCheckpointArgs {
+    /// The checkpoint subcommand to run.
+    #[facet(args::subcommand)]
+    pub command: SyncCheckpointCommand,
+}
+
+/// Nested sync checkpoint commands.
+// cli[impl command.surface.sync-checkpoint]
+#[derive(Facet, Arbitrary, Debug, PartialEq)]
+#[repr(u8)]
+pub enum SyncCheckpointCommand {
+    /// Reconstruct a checkpoint from archived output on disk.
+    Restore(SyncCheckpointRestoreArgs),
+}
+
+/// Restore a checkpoint from archived output.
+#[derive(Facet, Arbitrary, Debug, PartialEq)]
+#[facet(rename_all = "kebab-case")]
+pub struct SyncCheckpointRestoreArgs {
+    /// Reconstruct and compare without writing the checkpoint file.
+    #[facet(args::named, default)]
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedSync {
     pub output_dir: crate::paths::ResolvedOutputDir,
     pub state: crate::paths::SyncStateLayout,
+}
+
+// cli[impl sync.checkpoint.restore.dry-run]
+fn restore_sync_checkpoint(
+    prepared: &PreparedSync,
+    dry_run: bool,
+) -> Result<crate::archive::SyncCheckpointRestoreSummary> {
+    crate::archive::restore_checkpoint_from_output(
+        prepared.output_dir.path.as_path(),
+        &prepared.state,
+        dry_run,
+    )
 }
 
 /// # Errors
@@ -60,23 +113,72 @@ impl SyncArgs {
             environment_output_dir.as_deref(),
         )?;
 
-        let resolved_token = crate::paths::resolve_bot_token(self.token.as_deref())?;
-        let mut summary = crate::archive::run_sync(
-            prepared.output_dir.path.as_path(),
-            &prepared.state,
-            &resolved_token.token,
-        )
-        .await?;
-        summary.output_dir = prepared.output_dir.path.display().to_string();
-        summary.checkpoint_path = prepared.state.checkpoint_path.display().to_string();
-        crate::json_stdout::print_facet_json(&summary)?;
+        match self.command {
+            None => {
+                let resolved_token = crate::paths::resolve_bot_token(self.token.as_deref())?;
+                let mut summary = crate::archive::run_sync(
+                    prepared.output_dir.path.as_path(),
+                    &prepared.state,
+                    &resolved_token.token,
+                )
+                .await?;
+                summary.output_dir = prepared.output_dir.path.display().to_string();
+                summary.checkpoint_path = prepared.state.checkpoint_path.display().to_string();
+                crate::json_stdout::print_facet_json(&summary)?;
+            }
+            Some(command) => {
+                let summary = command.invoke(&prepared)?;
+                crate::json_stdout::print_facet_json(&summary)?;
+            }
+        }
         Ok(())
+    }
+}
+
+impl SyncCommand {
+    /// # Errors
+    ///
+    /// This function will return an error if the sync subcommand fails.
+    pub fn invoke(
+        self,
+        prepared: &PreparedSync,
+    ) -> Result<crate::archive::SyncCheckpointRestoreSummary> {
+        match self {
+            SyncCommand::Checkpoint(args) => args.invoke(prepared),
+        }
+    }
+}
+
+impl SyncCheckpointArgs {
+    /// # Errors
+    ///
+    /// This function will return an error if the checkpoint subcommand fails.
+    pub fn invoke(
+        self,
+        prepared: &PreparedSync,
+    ) -> Result<crate::archive::SyncCheckpointRestoreSummary> {
+        match self.command {
+            SyncCheckpointCommand::Restore(args) => args.invoke(prepared),
+        }
+    }
+}
+
+impl SyncCheckpointRestoreArgs {
+    /// # Errors
+    ///
+    /// This function will return an error if checkpoint reconstruction or comparison fails.
+    pub fn invoke(
+        self,
+        prepared: &PreparedSync,
+    ) -> Result<crate::archive::SyncCheckpointRestoreSummary> {
+        restore_sync_checkpoint(prepared, self.dry_run)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::prepare_sync;
+    use super::restore_sync_checkpoint;
     use crate::paths::AppHome;
     use crate::paths::CacheHome;
     use crate::paths::OutputDirSource;
@@ -149,5 +251,69 @@ mod tests {
                 .to_string()
                 .contains("No Discord bot token configured")
         );
+    }
+
+    #[test]
+    // cli[verify sync.checkpoint.restore.dry-run]
+    fn restore_sync_checkpoint_dry_run_compares_without_writing() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let app_home = AppHome(temp_dir.path().join("home"));
+        let cache_home = CacheHome(temp_dir.path().join("cache"));
+        let output_root = temp_dir.path().join("output");
+        let message_dir = output_root
+            .join("guilds")
+            .join("99")
+            .join("channels")
+            .join("10")
+            .join("messages");
+        std::fs::create_dir_all(&message_dir).expect("message dir should exist");
+        std::fs::write(
+            output_root
+                .join("guilds")
+                .join("99")
+                .join("channels")
+                .join("10")
+                .join("channel.json"),
+            "{}",
+        )
+        .expect("channel metadata should write");
+        std::fs::write(message_dir.join("50.json"), "hello").expect("message should write");
+
+        let prepared = prepare_sync(&app_home, &cache_home, Some(output_root), None)
+            .expect("sync preparation should succeed");
+        let existing = crate::archive::SyncCheckpoint {
+            version: 1,
+            targets: vec![crate::archive::SyncTargetCheckpoint {
+                guild_id: 99,
+                channel_id: 10,
+                parent_channel_id: None,
+                newest_message_id: Some(999),
+                oldest_message_id: Some(999),
+                historical_complete: true,
+                archived_message_count: Some(999),
+                archived_byte_count: Some(999),
+            }],
+        };
+        std::fs::write(
+            &prepared.state.checkpoint_path,
+            facet_json::to_string_pretty(&existing).expect("checkpoint should serialize"),
+        )
+        .expect("checkpoint should write");
+
+        let summary =
+            restore_sync_checkpoint(&prepared, true).expect("dry-run restore should succeed");
+
+        assert!(summary.dry_run);
+        assert!(summary.existing_checkpoint_found);
+        assert_eq!(summary.restored_target_count, 1);
+        assert_eq!(summary.restored_message_count, 1);
+        assert!(summary.comparison.is_some());
+
+        let on_disk: crate::archive::SyncCheckpoint = facet_json::from_str(
+            &std::fs::read_to_string(&prepared.state.checkpoint_path)
+                .expect("checkpoint should still exist"),
+        )
+        .expect("checkpoint should parse");
+        assert_eq!(on_disk, existing);
     }
 }
