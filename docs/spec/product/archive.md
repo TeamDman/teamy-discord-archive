@@ -14,6 +14,12 @@ The product must center the historical archival workflow around a resumable `syn
 archive[sync.writes-output-files]
 The `sync` command must write archived guild, channel, thread, message, and attachment data under the configured output directory.
 
+archive[sync.members.from-archived-messages]
+The member archival stage must discover guild members by scanning archived messages rather than requiring a separate full guild-member listing pass.
+
+archive[layout.guild-members]
+Archived member data must live under `guilds/{guild_id}/members/{user_id}`, with `user.json` for the global Discord user object and `avatars/` for downloaded avatar images.
+
 archive[sync.resume-from-checkpoint]
 The `sync` command must persist per-target cursors so that interrupted runs can resume rather than restarting from scratch.
 

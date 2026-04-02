@@ -10,8 +10,11 @@ use serenity::all::GuildInfo;
 use serenity::all::Http;
 use serenity::all::Message;
 use serenity::all::MessageId;
+use serenity::all::UserId;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -91,6 +94,8 @@ pub struct SyncRunSummary {
     pub resumed_targets: u64,
     pub messages_written: u64,
     pub attachments_downloaded: u64,
+    pub members_written: u64,
+    pub avatars_downloaded: u64,
     pub bytes_processed: u64,
 }
 
@@ -559,6 +564,256 @@ fn guild_metadata_path(output_root: &Path, guild_id: GuildId) -> PathBuf {
         .join("guilds")
         .join(guild_id.get().to_string())
         .join("guild.json")
+}
+
+fn guild_members_root(output_root: &Path, guild_id: u64) -> PathBuf {
+    output_root
+        .join("guilds")
+        .join(guild_id.to_string())
+        .join("members")
+}
+
+fn member_root(output_root: &Path, guild_id: u64, user_id: u64) -> PathBuf {
+    guild_members_root(output_root, guild_id).join(user_id.to_string())
+}
+
+fn member_user_path(output_root: &Path, guild_id: u64, user_id: u64) -> PathBuf {
+    member_root(output_root, guild_id, user_id).join("user.json")
+}
+
+fn member_avatars_root(output_root: &Path, guild_id: u64, user_id: u64) -> PathBuf {
+    member_root(output_root, guild_id, user_id).join("avatars")
+}
+
+fn avatar_file_name_from_url(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url);
+    let candidate = path.rsplit('/').next().unwrap_or_default();
+    if candidate.is_empty() {
+        "avatar.bin".to_owned()
+    } else {
+        candidate.to_owned()
+    }
+}
+
+fn author_user_id_from_raw_json(raw_json: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+    let author_id = value.get("author")?.get("id")?;
+    author_id
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| author_id.as_u64())
+}
+
+fn collect_member_targets_from_messages_dir(
+    guild_id: u64,
+    messages_dir: &Path,
+    member_targets: &mut BTreeMap<u64, BTreeSet<u64>>,
+) -> eyre::Result<()> {
+    for entry in sorted_directory_entries(messages_dir)? {
+        let entry_path = entry.path();
+        if !entry
+            .file_type()
+            .wrap_err_with(|| format!("Failed to inspect {}", entry_path.display()))?
+            .is_file()
+        {
+            continue;
+        }
+
+        if numeric_json_stem(&entry_path).is_none() {
+            continue;
+        }
+
+        let contents = std::fs::read_to_string(&entry_path).wrap_err_with(|| {
+            format!("Failed to read archived message {}", entry_path.display())
+        })?;
+        let record: ArchivedMessageRecord =
+            facet_json::from_str(&contents).wrap_err_with(|| {
+                format!(
+                    "Failed to parse archived message record from {}",
+                    entry_path.display()
+                )
+            })?;
+
+        if let Some(user_id) = author_user_id_from_raw_json(&record.raw_json) {
+            member_targets.entry(guild_id).or_default().insert(user_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// # Errors
+///
+/// This function will return an error if archived guild/channel/thread message directories cannot be read.
+pub fn collect_member_targets_from_output(
+    output_root: &Path,
+) -> eyre::Result<BTreeMap<u64, BTreeSet<u64>>> {
+    let guilds_dir = output_root.join("guilds");
+    let mut member_targets = BTreeMap::new();
+
+    for guild_entry in sorted_directory_entries(&guilds_dir)? {
+        let guild_path = guild_entry.path();
+        if !guild_entry
+            .file_type()
+            .wrap_err_with(|| format!("Failed to inspect {}", guild_path.display()))?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let Some(guild_id) = numeric_name(&guild_path) else {
+            continue;
+        };
+
+        let channels_dir = guild_path.join("channels");
+        for channel_entry in sorted_directory_entries(&channels_dir)? {
+            let channel_path = channel_entry.path();
+            if !channel_entry
+                .file_type()
+                .wrap_err_with(|| format!("Failed to inspect {}", channel_path.display()))?
+                .is_dir()
+            {
+                continue;
+            }
+
+            collect_member_targets_from_messages_dir(
+                guild_id,
+                &channel_path.join("messages"),
+                &mut member_targets,
+            )?;
+
+            let threads_dir = channel_path.join("threads");
+            for thread_entry in sorted_directory_entries(&threads_dir)? {
+                let thread_path = thread_entry.path();
+                if !thread_entry
+                    .file_type()
+                    .wrap_err_with(|| format!("Failed to inspect {}", thread_path.display()))?
+                    .is_dir()
+                {
+                    continue;
+                }
+
+                collect_member_targets_from_messages_dir(
+                    guild_id,
+                    &thread_path.join("messages"),
+                    &mut member_targets,
+                )?;
+            }
+        }
+
+        let orphan_threads_dir = guild_path.join("orphan-threads");
+        for thread_entry in sorted_directory_entries(&orphan_threads_dir)? {
+            let thread_path = thread_entry.path();
+            if !thread_entry
+                .file_type()
+                .wrap_err_with(|| format!("Failed to inspect {}", thread_path.display()))?
+                .is_dir()
+            {
+                continue;
+            }
+
+            collect_member_targets_from_messages_dir(
+                guild_id,
+                &thread_path.join("messages"),
+                &mut member_targets,
+            )?;
+        }
+    }
+
+    Ok(member_targets)
+}
+
+async fn archive_member_avatar(
+    http_client: &reqwest::Client,
+    output_root: &Path,
+    guild_id: u64,
+    user: &serenity::all::User,
+) -> eyre::Result<SyncWorkDelta> {
+    let avatar_url = user.face();
+    let avatar_file_name = avatar_file_name_from_url(&avatar_url);
+    let avatar_path =
+        member_avatars_root(output_root, guild_id, user.id.get()).join(avatar_file_name);
+    if avatar_path.exists() {
+        return Ok(SyncWorkDelta::default());
+    }
+
+    let bytes = http_client
+        .get(&avatar_url)
+        .send()
+        .await
+        .wrap_err_with(|| format!("Failed to request avatar {avatar_url}"))?
+        .error_for_status()
+        .wrap_err_with(|| format!("Failed to download avatar {avatar_url}"))?
+        .bytes()
+        .await
+        .wrap_err_with(|| format!("Failed to read avatar response body {avatar_url}"))?;
+
+    let mut delta = SyncWorkDelta::default();
+    delta.bytes_processed = delta
+        .bytes_processed
+        .saturating_add(write_binary_file(&avatar_path, bytes.as_ref())?);
+    delta.attachments_downloaded = 1;
+    Ok(delta)
+}
+
+/// # Errors
+///
+/// This function will return an error if archived message files cannot be scanned,
+/// Discord user lookup fails, or archived member files cannot be written.
+pub async fn run_member_sync(output_root: &Path, token: &str) -> eyre::Result<SyncRunSummary> {
+    let member_targets = collect_member_targets_from_output(output_root)?;
+    let http = Http::new(token);
+    let http_client = reqwest::Client::builder()
+        .build()
+        .wrap_err("Failed to build HTTP client for avatar downloads")?;
+
+    let mut summary = SyncRunSummary {
+        output_dir: output_root.display().to_string(),
+        checkpoint_path: String::new(),
+        guilds_seen: u64::try_from(member_targets.len()).unwrap_or(u64::MAX),
+        channels_seen: 0,
+        threads_seen: 0,
+        resumed_targets: 0,
+        messages_written: 0,
+        attachments_downloaded: 0,
+        members_written: 0,
+        avatars_downloaded: 0,
+        bytes_processed: 0,
+    };
+
+    for (&guild_id, user_ids) in &member_targets {
+        for &user_id in user_ids {
+            let user = http
+                .get_user(UserId::new(user_id))
+                .await
+                .wrap_err_with(|| format!("Failed to fetch user {user_id} for guild {guild_id}"))?;
+            summary.bytes_processed = summary.bytes_processed.saturating_add(write_raw_json_file(
+                &member_user_path(output_root, guild_id, user_id),
+                &user,
+            )?);
+            summary.members_written = summary.members_written.saturating_add(1);
+
+            let avatar_delta =
+                archive_member_avatar(&http_client, output_root, guild_id, &user).await?;
+            summary.bytes_processed = summary
+                .bytes_processed
+                .saturating_add(avatar_delta.bytes_processed);
+            summary.avatars_downloaded = summary
+                .avatars_downloaded
+                .saturating_add(avatar_delta.attachments_downloaded);
+        }
+    }
+
+    tracing::info!(
+        event = "sync.members.complete",
+        guilds_seen = summary.guilds_seen,
+        members_written = summary.members_written,
+        avatars_downloaded = summary.avatars_downloaded,
+        bytes_processed = summary.bytes_processed,
+        "member sync completed"
+    );
+
+    Ok(summary)
 }
 
 fn sorted_directory_entries(path: &Path) -> eyre::Result<Vec<std::fs::DirEntry>> {
@@ -1715,7 +1970,7 @@ async fn sync_guild(
 /// This function will return an error if the Discord API calls fail or if archive data cannot be written.
 // archive[impl goal.resumable-sync-entrypoint]
 // archive[impl goal.local-filesystem-output]
-pub async fn run_sync(
+pub async fn run_message_sync(
     output_root: &Path,
     layout: &SyncStateLayout,
     token: &str,
@@ -1740,6 +1995,8 @@ pub async fn run_sync(
         resumed_targets: tracker.resumed_targets,
         messages_written: 0,
         attachments_downloaded: 0,
+        members_written: 0,
+        avatars_downloaded: 0,
         bytes_processed: 0,
     };
 
@@ -1783,9 +2040,33 @@ pub async fn run_sync(
     Ok(summary)
 }
 
+/// # Errors
+///
+/// This function will return an error if either the message sync or member sync phase fails.
+pub async fn run_sync(
+    output_root: &Path,
+    layout: &SyncStateLayout,
+    token: &str,
+) -> eyre::Result<SyncRunSummary> {
+    let mut summary = run_message_sync(output_root, layout, token).await?;
+    let member_summary = run_member_sync(output_root, token).await?;
+    summary.guilds_seen = summary.guilds_seen.max(member_summary.guilds_seen);
+    summary.members_written = summary
+        .members_written
+        .saturating_add(member_summary.members_written);
+    summary.avatars_downloaded = summary
+        .avatars_downloaded
+        .saturating_add(member_summary.avatars_downloaded);
+    summary.bytes_processed = summary
+        .bytes_processed
+        .saturating_add(member_summary.bytes_processed);
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::ArchivedAttachmentIndex;
+    use super::ArchivedMessageRecord;
     use super::CHECKPOINT_VERSION;
     use super::SyncCheckpoint;
     use super::SyncProgressTracker;
@@ -1794,7 +2075,10 @@ mod tests {
     use super::attachment_blob_relative_path;
     use super::attachment_index_path;
     use super::attachments_root;
+    use super::author_user_id_from_raw_json;
+    use super::avatar_file_name_from_url;
     use super::checkpoint_state;
+    use super::collect_member_targets_from_output;
     use super::ensure_checkpoint_for_sync;
     use super::estimate_target_total_messages;
     use super::is_missing_access_error_code;
@@ -1943,6 +2227,105 @@ mod tests {
         assert_eq!(target.guild_name(), "guild-99");
         assert_eq!(target.channel_name(), "parent-channel");
         assert_eq!(target.thread_name(), "thread-name");
+    }
+
+    #[test]
+    fn avatar_file_name_uses_last_url_segment() {
+        assert_eq!(
+            avatar_file_name_from_url("https://cdn.discordapp.com/avatars/1/hash.webp?size=1024"),
+            "hash.webp"
+        );
+        assert_eq!(
+            avatar_file_name_from_url("https://cdn.discordapp.com/embed/avatars/3.png"),
+            "3.png"
+        );
+    }
+
+    #[test]
+    fn author_user_id_reads_message_author_id() {
+        let raw_json = r#"{"author":{"id":"12345","username":"name"}}"#;
+        assert_eq!(author_user_id_from_raw_json(raw_json), Some(12_345));
+    }
+
+    #[test]
+    fn collect_member_targets_from_output_deduplicates_authors_per_guild() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let output_root = temp_dir.path().join("output");
+        let message_dir = output_root
+            .join("guilds")
+            .join("99")
+            .join("channels")
+            .join("10")
+            .join("messages");
+        std::fs::create_dir_all(&message_dir).expect("message dir should exist");
+
+        let first = ArchivedMessageRecord {
+            schema_version: 1,
+            archived_at: "2026-01-01T00:00:00Z".to_owned(),
+            guild_id: 99,
+            channel_id: 10,
+            parent_channel_id: None,
+            message_id: 100,
+            raw_json: r#"{"author":{"id":"123","username":"first"}}"#.to_owned(),
+            attachments: Vec::new(),
+        };
+        let second = ArchivedMessageRecord {
+            schema_version: 1,
+            archived_at: "2026-01-01T00:00:00Z".to_owned(),
+            guild_id: 99,
+            channel_id: 10,
+            parent_channel_id: None,
+            message_id: 101,
+            raw_json: r#"{"author":{"id":"123","username":"first"}}"#.to_owned(),
+            attachments: Vec::new(),
+        };
+        let third = ArchivedMessageRecord {
+            schema_version: 1,
+            archived_at: "2026-01-01T00:00:00Z".to_owned(),
+            guild_id: 99,
+            channel_id: 10,
+            parent_channel_id: None,
+            message_id: 102,
+            raw_json: r#"{"author":{"id":"456","username":"second"}}"#.to_owned(),
+            attachments: Vec::new(),
+        };
+
+        std::fs::write(
+            message_dir.join("100.json"),
+            facet_json::to_string_pretty(&first).expect("record should serialize"),
+        )
+        .expect("message should write");
+        std::fs::write(
+            message_dir.join("101.json"),
+            facet_json::to_string_pretty(&second).expect("record should serialize"),
+        )
+        .expect("message should write");
+        std::fs::write(
+            message_dir.join("102.json"),
+            facet_json::to_string_pretty(&third).expect("record should serialize"),
+        )
+        .expect("message should write");
+
+        let member_targets = collect_member_targets_from_output(&output_root)
+            .expect("member targets should scan from output");
+
+        assert_eq!(member_targets.len(), 1);
+        assert_eq!(
+            member_targets.get(&99).expect("guild should exist").len(),
+            2
+        );
+        assert!(
+            member_targets
+                .get(&99)
+                .expect("guild should exist")
+                .contains(&123)
+        );
+        assert!(
+            member_targets
+                .get(&99)
+                .expect("guild should exist")
+                .contains(&456)
+        );
     }
 
     #[test]

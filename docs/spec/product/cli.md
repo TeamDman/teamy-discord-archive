@@ -44,7 +44,13 @@ cli[command.surface.live-user]
 The `live user` command group must expose the `list` subcommand.
 
 cli[command.surface.sync]
-The `sync` command must exist as the resumable archive entrypoint for future Discord archival work and expose the `checkpoint` subcommand group.
+The `sync` command must exist as the resumable archive entrypoint for future Discord archival work and expose the `messages`, `members`, and `checkpoint` subcommand groups.
+
+cli[command.surface.sync-messages]
+The `sync messages` command must expose the resumable message and attachment archival stage on its own.
+
+cli[command.surface.sync-members]
+The `sync members` command must expose the member and avatar archival stage on its own.
 
 cli[command.surface.sync-checkpoint]
 The `sync checkpoint` command group must expose the `restore` subcommand.

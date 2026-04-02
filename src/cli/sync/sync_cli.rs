@@ -26,10 +26,22 @@ pub struct SyncArgs {
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum SyncCommand {
+    /// Synchronize archived messages and attachments only.
+    Messages(SyncMessagesArgs),
+    /// Synchronize archived guild-scoped member records and avatars from archived messages.
+    Members(SyncMembersArgs),
     /// Checkpoint maintenance commands.
     // cli[impl command.surface.sync-checkpoint]
     Checkpoint(SyncCheckpointArgs),
 }
+
+/// Run only the message sync stage.
+#[derive(Facet, Arbitrary, Debug, PartialEq)]
+pub struct SyncMessagesArgs;
+
+/// Run only the member sync stage.
+#[derive(Facet, Arbitrary, Debug, PartialEq)]
+pub struct SyncMembersArgs;
 
 /// Sync checkpoint maintenance commands.
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
@@ -126,26 +138,58 @@ impl SyncArgs {
                 summary.checkpoint_path = prepared.state.checkpoint_path.display().to_string();
                 crate::json_stdout::print_facet_json(&summary)?;
             }
-            Some(command) => {
-                let summary = command.invoke(&prepared)?;
-                crate::json_stdout::print_facet_json(&summary)?;
-            }
+            Some(command) => match command {
+                SyncCommand::Messages(args) => {
+                    let resolved_token = crate::paths::resolve_bot_token(self.token.as_deref())?;
+                    let mut summary = args.invoke(&prepared, &resolved_token.token).await?;
+                    summary.output_dir = prepared.output_dir.path.display().to_string();
+                    summary.checkpoint_path = prepared.state.checkpoint_path.display().to_string();
+                    crate::json_stdout::print_facet_json(&summary)?;
+                }
+                SyncCommand::Members(args) => {
+                    let resolved_token = crate::paths::resolve_bot_token(self.token.as_deref())?;
+                    let mut summary = args.invoke(&prepared, &resolved_token.token).await?;
+                    summary.output_dir = prepared.output_dir.path.display().to_string();
+                    summary.checkpoint_path = prepared.state.checkpoint_path.display().to_string();
+                    crate::json_stdout::print_facet_json(&summary)?;
+                }
+                SyncCommand::Checkpoint(args) => {
+                    let summary = args.invoke(&prepared)?;
+                    crate::json_stdout::print_facet_json(&summary)?;
+                }
+            },
         }
         Ok(())
     }
 }
 
-impl SyncCommand {
+impl SyncMessagesArgs {
     /// # Errors
     ///
-    /// This function will return an error if the sync subcommand fails.
-    pub fn invoke(
+    /// This function will return an error if the message sync phase fails.
+    pub async fn invoke(
         self,
         prepared: &PreparedSync,
-    ) -> Result<crate::archive::SyncCheckpointRestoreSummary> {
-        match self {
-            SyncCommand::Checkpoint(args) => args.invoke(prepared),
-        }
+        token: &str,
+    ) -> Result<crate::archive::SyncRunSummary> {
+        crate::archive::run_message_sync(prepared.output_dir.path.as_path(), &prepared.state, token)
+            .await
+    }
+}
+
+impl SyncMembersArgs {
+    /// # Errors
+    ///
+    /// This function will return an error if the member sync phase fails.
+    pub async fn invoke(
+        self,
+        prepared: &PreparedSync,
+        token: &str,
+    ) -> Result<crate::archive::SyncRunSummary> {
+        let mut summary =
+            crate::archive::run_member_sync(prepared.output_dir.path.as_path(), token).await?;
+        summary.checkpoint_path = prepared.state.checkpoint_path.display().to_string();
+        Ok(summary)
     }
 }
 
